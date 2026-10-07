@@ -1,0 +1,5 @@
+# NSE trading holidays, one date per line (YYYY-MM-DD). Lines starting with # are ignored.
+# Weekends are skipped automatically. Copy the weekday holidays from the official list:
+# https://www.nseindia.com/resources/exchange-communication-holidays
+#
+# 2026-10-20
