@@ -78,9 +78,9 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
 
     dhan, day = Dhan(cfg), today()
     now = datetime.now(IST).time()
-    # At 09:15-09:16 the day's OHLC *is* the 1-minute range, so one request covers
-    # all stocks. Outside that window we fall back to ~1 request per stock.
-    live = not use_history and (now.hour, now.minute) in {(9, 15), (9, 16)}
+    # At 09:20-09:21 the 5-min OHLC is fully formed in one quote request.
+    # Outside that window we fall back to ~1 request per stock (historical candles).
+    live = not use_history and (now.hour, now.minute) in {(9, 20), (9, 21)}
     quotes = dhan.quotes([u["security_id"] for u in universe])   # also gives prev close
     if quotes_are_stale(quotes, datetime.now(IST)):
         raise NoMarketData("quotes are not from today (market holiday?)")

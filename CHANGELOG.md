@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.1.1] – 2026-10-09
+
+### Strategy Changes
+
+#### Timeframe: 1-minute → 5-minute (reverted)
+- Switched back from 1m to **5-minute candles** (`interval: "5"` in the Dhan API call).
+- The 09:15 opening candle is now a proper **5-min candle** (09:15 – 09:20).
+- `ENTRY_TIME` restored to `09:20` (the first confirmation candle starts at 09:20).
+- Affected files: `strategy.py`, `broker.py`.
+
+#### Confirmation Window Capped at 11:30 IST
+- Added `TRADE_CUTOFF = time(11, 25)` in `strategy.py`.
+- After the 09:15 5-min candle, the system scans 5-min candles for a
+  breakout/breakdown close, but **only up to the 11:25 candle** (which closes at 11:30).
+- If no confirmation is found by 11:30, the trade is skipped:
+  `"no breakout/breakdown confirmation by 11:30"`.
+- Affected file: `strategy.py` (`open_position`).
+
+#### Broker: 5-min Candle Window for Opening Range
+- `stock_opening_range()` now fetches `09:15:00`–`09:20:59` (was `09:16:59`).
+- Filters for the `09:15` 5-min candle by timestamp.
+- Affected file: `broker.py`.
+
+#### Scan: Live Window Restored to 09:20
+- Live-snapshot scan window restored to `{(9, 20), (9, 21)}` to match when
+  the 5-min candle is fully formed.
+- Affected file: `run.py`.
+
+#### Dashboard: "5-min range %" Label Restored
+- Movers table column restored to "5-min range %".
+- Affected file: `dashboard.py`.
+
+---
+
 ## [1.1.0] – 2026-10-07
 
 ### Strategy Changes

@@ -319,7 +319,7 @@ def render(requested_day: str | None = None) -> str:
 
     movers = small_table(_read_rows(DATA / day / "movers.csv"),
                          [("symbol", "Stock"), ("direction", "Side"), ("change_pct", "Change %"),
-                          ("range_pct", "1-min range %")])
+                          ("range_pct", "5-min range %")])
     skipped = small_table(_read_rows(DATA / day / "skipped.csv"),
                           [("symbol", "Stock"), ("reason", "Why it was skipped")])
 

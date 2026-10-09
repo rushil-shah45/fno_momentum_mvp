@@ -65,7 +65,7 @@ class Dhan:
         if wait > 0:
             time.sleep(wait)
         body = {"securityId": security_id, "exchangeSegment": segment,
-                "instrument": instrument, "interval": "1", "oi": False,
+                "instrument": instrument, "interval": "5", "oi": False,
                 "fromDate": f"{day} {start}", "toDate": f"{day} {end}"}
         data = self._post("/charts/intraday", body)
         self._last_history_call = time.monotonic()
@@ -80,12 +80,12 @@ class Dhan:
         return self._candles(security_id, "NSE_FNO", "OPTSTK", day, "09:15:00", "15:01:00")
 
     def stock_opening_range(self, security_id: str, day: str) -> OpeningRange:
-        """Fetch the single 09:15 one-minute candle as the opening range (v1.1: 1m TF)."""
+        """Fetch the 09:15 5-min candle as the opening range (v1.1: 5m TF)."""
         bars = [b for b in self._candles(security_id, "NSE_EQ", "EQUITY", day,
-                                         "09:15:00", "09:16:59")
+                                         "09:15:00", "09:20:59")
                 if clock(b.ts) == MARKET_OPEN]
         if not bars:
-            raise RuntimeError("09:15 candle not available")
+            raise RuntimeError("09:15 5-min candle not available")
         b = bars[0]
         return OpeningRange(b.open, b.high, b.low, b.close, b.volume)
 

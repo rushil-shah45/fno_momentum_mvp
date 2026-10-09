@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
-ENTRY_TIME = time(9, 16)   # v1.1: only the 09:15 1-min candle is the "opening" candle
+ENTRY_TIME = time(9, 20)       # v1.1: 5-min candle at 09:15 closes at 09:20
+TRADE_CUTOFF = time(11, 25)    # v1.1: last confirmation candle allowed (closes at 11:30)
 
 
 # --------------------------------------------------------------------------- data
@@ -55,10 +56,10 @@ def fmt_time(ts: int | None) -> str:
 # ------------------------------------------------------------ 1. the setup signal
 def classify(r: OpeningRange, tolerance: float, close_zone: float,
              max_range_pct: float) -> tuple[str, str, float]:
-    """Return (direction, reason, range_pct) for the 09:15 1-min opening candle.
+    """Return (direction, reason, range_pct) for the 09:15 5-min opening candle.
 
-    CALL: Open = Low  and the 1-min close in the top 20% of the range (bullish candle).
-    PUT : Open = High and the 1-min close in the bottom 20% of the range (bearish candle).
+    CALL: Open = Low  and the 5-min close in the top 20% of the range (bullish candle).
+    PUT : Open = High and the 5-min close in the bottom 20% of the range (bearish candle).
     direction is "" when the stock does not qualify.
     """
     rng = r.high - r.low
@@ -71,9 +72,9 @@ def classify(r: OpeningRange, tolerance: float, close_zone: float,
     close_near_high = (r.high - r.close) <= rng * close_zone
     close_near_low = (r.close - r.low) <= rng * close_zone
     if abs(r.open - r.low) <= tolerance and close_near_high:
-        return "CALL", "Open = Low, 1-min close near High (bullish)", range_pct
+        return "CALL", "Open = Low, 5-min close near High (bullish)", range_pct
     if abs(r.high - r.open) <= tolerance and close_near_low:
-        return "PUT", "Open = High, 1-min close near Low (bearish)", range_pct
+        return "PUT", "Open = High, 5-min close near Low (bearish)", range_pct
     return "", "pattern not qualified", range_pct
 
 
@@ -140,7 +141,7 @@ class Position:
         self.exit_price, self.exit_ts, self.status = price, ts, status
 
     def on_bar(self, bar: Bar) -> None:
-        """Advance one 1-minute option candle. We always BUY options, so a stop
+        """Advance one 5-minute option candle. We always BUY options, so a stop
         sits below price and triggers when the bar's low touches it.
 
         v1.1 trailing rule: once price closes 1 point above entry, trailing
@@ -168,10 +169,11 @@ def open_position(symbol: str, direction: str, contract: Contract, bars: list[Ba
                   ) -> tuple[Position | None, list[Bar], str]:
     """Build the paper position from the option's candles.
 
-    v1.1 logic (1-min timeframe):
-      - Opening bar  = the single 09:15 1-min candle.
-      - Confirmation = the first subsequent 1-min candle whose CLOSE breaks above
-                       the 09:15 high (CALL) or below the 09:15 low (PUT).
+    v1.1 logic (5-min timeframe, breakout/breakdown confirmation until 11:30):
+      - Opening bar  = the 09:15 5-min candle (timestamp 09:15, closes at 09:20).
+      - Confirmation = the first 5-min candle at or after 09:20 whose CLOSE breaks
+                       above the 09:15 high (CALL) or below the 09:15 low (PUT),
+                       and whose start time is <= TRADE_CUTOFF (11:25 IST, closes 11:30).
       - Entry        = the close price of that confirmation candle.
       - Stop         = the low of the 09:15 candle (CALL) or its high (PUT).
       - Lots         = always 1 (fixed).
@@ -179,32 +181,35 @@ def open_position(symbol: str, direction: str, contract: Contract, bars: list[Ba
     Returns (position or None, remaining bars after entry, skip_reason).
     """
     opening = [b for b in bars if clock(b.ts) == MARKET_OPEN]
-    later = [b for b in bars if clock(b.ts) >= ENTRY_TIME]
+    # Confirmation window: 09:20 up to and including 11:25 (that candle closes at 11:30)
+    window = [b for b in bars if ENTRY_TIME <= clock(b.ts) <= TRADE_CUTOFF]
+    all_later = [b for b in bars if clock(b.ts) >= ENTRY_TIME]
+
     if not opening:
         return None, [], "no 09:15 candle available"
-    if not later:
-        return None, [], "no candles after 09:15 to confirm breakout"
+    if not window:
+        return None, [], "no 5-min candles in confirmation window (09:20-11:30)"
 
-    setup = opening[0]                   # the single 09:15 1-min candle
+    setup = opening[0]                   # the 09:15 5-min candle
     setup_high = setup.high
     setup_low = setup.low
 
-    # Scan for the confirmation candle (close beyond the 09:15 range).
-    confirm_idx: int | None = None
-    for i, b in enumerate(later):
+    # Scan for the confirmation candle within the 09:20-11:30 window.
+    confirm_bar: Bar | None = None
+    for b in window:
         if direction == "CALL" and b.close > setup_high:
-            confirm_idx = i
+            confirm_bar = b
             break
         if direction == "PUT" and b.close < setup_low:
-            confirm_idx = i
+            confirm_bar = b
             break
 
-    if confirm_idx is None:
-        return None, [], "no breakout/breakdown confirmation candle found"
+    if confirm_bar is None:
+        return None, [], "no breakout/breakdown confirmation by 11:30"
 
-    entry_bar = later[confirm_idx]
-    rest = later[confirm_idx + 1:]
-    entry = entry_bar.close              # enter on the confirmation candle close
+    # Remaining bars for position management = everything after the confirmation candle.
+    rest = [b for b in all_later if b.ts > confirm_bar.ts]
+    entry = confirm_bar.close            # enter on the confirmation candle close
 
     # Stop: below the 09:15 low for CALL; above the 09:15 high for PUT.
     stop = setup_low if direction == "CALL" else setup_high
@@ -214,8 +219,8 @@ def open_position(symbol: str, direction: str, contract: Contract, bars: list[Ba
 
     lots = 1                             # v1.1: always 1 lot
 
-    pos = Position(symbol, direction, contract, lots, entry_bar.ts, entry, stop, stop,
-                   risk, last_price=entry_bar.close)
+    pos = Position(symbol, direction, contract, lots, confirm_bar.ts, entry, stop, stop,
+                   risk, last_price=confirm_bar.close)
     return pos, rest, ""
 
 
