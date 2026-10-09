@@ -63,55 +63,82 @@ class SelectionTests(unittest.TestCase):
 
 class PositionTests(unittest.TestCase):
     def make(self, later, **kw):
-        bars = opening_bars() + [bar("09:20", 100, 101, 99, 100)] + later
+        bars = [bar("09:15", 95, 100, 90.0, 98),
+                bar("09:20", 100, 105, 99, 102)] + later
         pos, rest, why = open_position("X", "CALL", CE, bars, kw.get("risk", 2000), kw.get("enf", True))
         return pos, rest, why
 
-    def test_entry_and_stop_from_clock_not_index(self):
-        # Option had no 09:15-09:17 candles; entry must still be the 09:20 open.
-        bars = [bar("09:18", 95, 100, 92, 98), bar("09:19", 98, 99, 91, 95),
-                bar("09:20", 100, 101, 99, 100)]
-        pos, _, _ = open_position("X", "CALL", CE, bars, 5000, True)
-        self.assertEqual((pos.entry, pos.initial_stop), (100, 91))
+    def test_breakout_call_entry_and_stop(self):
+        bars = [bar("09:15", 95, 100, 90, 98),
+                bar("09:20", 99, 100, 98, 99),
+                bar("09:25", 99, 105, 99, 103)]
+        pos, rest, why = open_position("X", "CALL", CE, bars, 5000, True)
+        self.assertIsNotNone(pos)
+        self.assertEqual(why, "")
+        self.assertEqual((pos.entry, pos.initial_stop), (103, 90))
+        self.assertEqual(pos.lots, 1)
+        self.assertEqual(len(rest), 0)
+
+    def test_breakdown_put_entry_and_stop(self):
+        pe = Contract("2", "PE", date(2026, 9, 29), 100.0, 100)
+        bars = [bar("09:15", 95, 100, 90, 92),
+                bar("09:20", 91, 91, 85, 88)]
+        pos, rest, why = open_position("X", "PUT", pe, bars, 5000, True)
+        self.assertIsNotNone(pos)
+        self.assertEqual(why, "")
+        self.assertEqual((pos.entry, pos.initial_stop), (88, 100))
+        self.assertEqual(pos.lots, 1)
+
+    def test_no_breakout_before_1130_skips(self):
+        bars = [bar("09:15", 95, 100, 90, 98),
+                bar("09:20", 95, 99, 94, 98),
+                bar("11:25", 95, 100, 94, 99)]
+        pos, _, why = open_position("X", "CALL", CE, bars, 5000, True)
+        self.assertIsNone(pos)
+        self.assertEqual(why, "no breakout/breakdown confirmation by 11:30")
+
+    def test_breakout_after_1130_is_not_taken(self):
+        bars = [bar("09:15", 95, 100, 90, 98),
+                bar("09:20", 95, 99, 94, 98),
+                bar("11:30", 100, 105, 99, 102)]
+        pos, _, why = open_position("X", "CALL", CE, bars, 5000, True)
+        self.assertIsNone(pos)
+        self.assertEqual(why, "no breakout/breakdown confirmation by 11:30")
 
     def test_stop_hit(self):
-        pos, rest, _ = self.make([bar("09:21", 100, 101, 89, 90)])
+        pos, rest, _ = self.make([bar("09:25", 102, 103, 89, 90)])
         run_session([pos], {"X": rest}, 10**9, time(15, 0))
         self.assertEqual((pos.status, pos.exit_price), ("EXIT_STOP", 90.0))
         self.assertAlmostEqual(pos.r_multiple, -1.0)
 
     def test_trailing_then_stop(self):
-        # risk = 10. +1R at 110 -> stop to entry(100); then trails lows.
-        pos, rest, _ = self.make([bar("09:21", 100, 111, 100.5, 110),
-                                  bar("09:22", 110, 120, 108, 119),
-                                  bar("09:23", 119, 119, 107, 108)])
+        pos, rest, _ = self.make([bar("09:25", 102, 104, 101, 103.5),
+                                  bar("09:30", 103.5, 108, 106, 107),
+                                  bar("09:35", 107, 107, 104, 105)])
         run_session([pos], {"X": rest}, 10**9, time(15, 0))
         self.assertTrue(pos.trailing)
-        self.assertEqual((pos.status, pos.exit_price), ("EXIT_STOP", 108.0))
+        self.assertEqual((pos.status, pos.exit_price), ("EXIT_STOP", 105.0))
         self.assertGreater(pos.pnl, 0)
 
-    def test_risk_limit_skips_or_sizes(self):
-        _, _, why = self.make([], risk=500)            # 1 lot risks 10*100 = 1000
-        self.assertIn("limit", why)
-        pos, _, _ = self.make([], risk=2500)           # floor(2500/1000) = 2 lots
-        self.assertEqual(pos.lots, 2)
-        pos, _, _ = self.make([], risk=500, enf=False)
+    def test_always_one_lot(self):
+        pos, _, _ = self.make([], risk=500)
         self.assertEqual(pos.lots, 1)
+        pos2, _, _ = self.make([], risk=50000)
+        self.assertEqual(pos2.lots, 1)
 
     def test_force_exit(self):
-        pos, rest, _ = self.make([bar("14:59", 100, 103, 99, 102), bar("15:00", 102, 103, 99, 100)])
+        pos, rest, _ = self.make([bar("14:55", 102, 103, 101, 102), bar("15:00", 102, 103, 101, 102)])
         run_session([pos], {"X": rest}, 10**9, time(15, 0))
         self.assertEqual((pos.status, pos.exit_price), ("EXIT_FORCED", 102.0))
 
     def test_daily_loss_limit_closes_open_positions(self):
-        pos, rest, _ = self.make([bar("09:21", 100, 100.5, 95, 95), bar("09:22", 95, 96, 94, 94)],
-                                 risk=2000)
-        note = run_session([pos], {"X": rest}, 400, time(15, 0))
+        pos, rest, _ = self.make([bar("09:25", 102, 102.5, 95, 95)])
+        note = run_session([pos], {"X": rest}, 500, time(15, 0))
         self.assertEqual(note, "daily loss limit hit")
         self.assertEqual(pos.status, "EXIT_DAILY_LOSS")
 
     def test_still_open(self):
-        pos, rest, _ = self.make([bar("09:21", 100, 102, 99, 101)])
+        pos, rest, _ = self.make([bar("09:25", 102, 103, 101, 102.5)])
         run_session([pos], {"X": rest}, 10**9, time(15, 0))
         self.assertEqual(pos.status, "OPEN")
 

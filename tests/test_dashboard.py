@@ -14,15 +14,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dashboard
 
-FIELDS = ["symbol", "direction", "option", "strike", "expiry", "lots", "qty", "entry_time", "entry",
-          "initial_stop", "stop_now", "exit_time", "exit_or_last", "pnl", "r_multiple", "trailing", "status"]
+FIELDS = ["symbol", "direction", "option", "strike", "expiry", "lots", "qty", "capital_used",
+          "entry_time", "entry", "initial_stop", "stop_now", "exit_time", "exit_or_last",
+          "pnl", "r_multiple", "trailing", "status"]
 
 
-def trade(symbol, pnl, status="EXIT_STOP", r=1.0):
+def trade(symbol, pnl, status="EXIT_STOP", r=1.0, trailing=False, capital_used=1000.0):
     return dict(symbol=symbol, direction="CALL", option="CE", strike=1400.0, expiry="2026-09-29",
-                lots=1, qty=100, entry_time="09:20:00", entry=10.0, initial_stop=9.0, stop_now=9.0,
-                exit_time="" if status == "OPEN" else "10:05:00", exit_or_last=11.0, pnl=pnl,
-                r_multiple=r, trailing=False, status=status)
+                lots=1, qty=100, capital_used=capital_used, entry_time="09:20:00", entry=10.0,
+                initial_stop=9.0, stop_now=9.0, exit_time="" if status == "OPEN" else "10:05:00",
+                exit_or_last=11.0, pnl=pnl, r_multiple=r, trailing=trailing, status=status)
 
 
 def write_day(root: Path, day: str, rows: list[dict]):
@@ -83,6 +84,21 @@ class RenderTests(unittest.TestCase):
         for text in ("RELIANCE", "TCS", "₹1,234", "-₹500", "50%", "09:20:00", "10:05:00", "PAPER ONLY"):
             self.assertIn(text, html)
         self.assertNotIn("<script", html.lower())                    # no JavaScript at all
+
+    def test_render_capital_used_and_trailing(self):
+        write_day(self.root, "2026-09-25", [
+            trade("RELIANCE", 500.0, status="OPEN", trailing=True, capital_used=25000.0),
+            trade("TCS", -200.0, status="EXIT_STOP", trailing=True, capital_used=15000.0),
+            trade("INFY", -100.0, status="EXIT_STOP", trailing=False, capital_used=8000.0),
+        ])
+        html = dashboard.render("2026-09-25")
+        self.assertIn("Capital Used", html)
+        self.assertIn("₹25,000", html)
+        self.assertIn("₹15,000", html)
+        self.assertIn("₹8,000", html)
+        self.assertIn("TSL active", html)
+        self.assertIn("Trailed", html)
+        self.assertIn("Fixed", html)
 
     def test_html_is_escaped(self):
         write_day(self.root, "2026-09-25", [trade("<script>alert(1)</script>", 10.0)])
