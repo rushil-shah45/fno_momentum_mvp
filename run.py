@@ -1,5 +1,6 @@
 """Command-line entry point.
 
+    python run.py --login           # authenticate with Dhan (PIN + TOTP) & cache token
     python run.py universe          # once a day (or week): list F&O stocks
     python run.py scan              # at ~09:20 IST: find setups + top movers
     python run.py trade             # after 09:20: paper-trade the movers' ATM options
@@ -198,9 +199,41 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
         time.sleep(60)
 
 
+def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None) -> None:
+    from auth import login, check_access
+    print("Authenticating with Dhan...")
+    try:
+        token, expiry = login(cfg, pin=pin, totp=totp)
+    except Exception as e:
+        raise SystemExit(f"Authentication failed: {e}")
+    masked = f"{token[:8]}...{token[-6:]}" if len(token) > 14 else token
+    print("[✓] Dhan authentication successful!")
+    print(f"    Client ID : {cfg.client_id or 'provided'}")
+    print(f"    Token     : {masked}")
+    print(f"    Expires   : {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print("    Cached in : data/token.json")
+
+    ok, status_code, msg, profile = check_access(token, cfg.client_id)
+    if ok:
+        print("[✓] Dhan API access verified.")
+        if profile and profile.get("dataPlan") == "Deactive":
+            print("[!] Notice: Dhan Data API plan is 'Deactive' on this account.")
+            print("    If market data scanning fails with Error 806, activate the free Data API on web.dhan.co -> DhanHQ APIs.")
+    else:
+        print(f"[!] Warning: Access check returned HTTP {status_code} ({msg}).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="F&O opening-range momentum - paper trading MVP")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser.add_argument("--login", action="store_true", help="authenticate with Dhan (PIN + TOTP) and cache fresh access token")
+    parser.add_argument("--pin", type=str, default=None, help="6-digit Dhan PIN (optional, overrides .env)")
+    parser.add_argument("--totp", type=str, default=None, help="6-digit TOTP code or secret (optional, overrides .env)")
+
+    sub = parser.add_subparsers(dest="cmd", required=False)
+    login_cmd = sub.add_parser("login", help="authenticate with Dhan (PIN + TOTP) and cache fresh access token")
+    login_cmd.add_argument("--pin", type=str, default=None, help="6-digit Dhan PIN (optional, overrides .env)")
+    login_cmd.add_argument("--totp", type=str, default=None, help="6-digit TOTP code or secret (optional, overrides .env)")
+
     sub.add_parser("universe")
     scan = sub.add_parser("scan")
     scan.add_argument("--history", action="store_true", help="force historical candles")
@@ -210,6 +243,17 @@ def main() -> None:
     dash = sub.add_parser("dashboard", help="open the trade dashboard in your browser")
     dash.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
+
+    if getattr(args, "login", False) or args.cmd == "login":
+        cfg = load_settings()
+        pin = getattr(args, "pin", None)
+        totp = getattr(args, "totp", None)
+        cmd_login(cfg, pin=pin, totp=totp)
+        return
+
+    if not args.cmd:
+        parser.print_help()
+        return
 
     if args.cmd == "daemon":
         from scheduler import run_forever      # imported here to avoid a circular import

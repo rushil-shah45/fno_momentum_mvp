@@ -21,11 +21,14 @@ HISTORY_PAUSE = 1.05   # Dhan rate-limits the historical-data endpoint
 
 class Dhan:
     def __init__(self, cfg: Settings):
-        has_login = auth.auto_enabled(cfg) or (cfg.access_token and
-                                               not cfg.access_token.startswith("replace_with"))
+        has_login = (
+            auth.auto_enabled(cfg)
+            or bool(auth._read_cache(cfg.client_id))
+            or (cfg.access_token and not cfg.access_token.startswith("replace_with"))
+        )
         if not cfg.client_id or cfg.client_id.startswith("replace_with") or not has_login:
             raise SystemExit("Set DHAN_CLIENT_ID plus either DHAN_PIN + DHAN_TOTP_SECRET "
-                             "(automatic) or DHAN_ACCESS_TOKEN (manual) in .env.")
+                             "(automatic) or DHAN_ACCESS_TOKEN in .env, or run `python run.py --login`.")
         self.cfg = cfg
         self.http = requests.Session()
         self.http.trust_env = False        # ignore stale system proxy settings
@@ -41,10 +44,15 @@ class Dhan:
         renewed = False
         for attempt in range(3):
             resp = self.http.post(f"{BASE_URL}{path}", json=payload, timeout=30)
-            if resp.status_code == 401 and auth.auto_enabled(self.cfg) and not renewed:
-                renewed = True                     # token expired mid-run: mint a new one once
-                self.http.headers["access-token"] = auth.get_access_token(self.cfg, force=True)
-                continue
+            if resp.status_code == 401:
+                body_text = getattr(resp, "text", "")
+                if "806" in body_text or "Data APIs not Subscribed" in body_text:
+                    raise RuntimeError("Dhan 401: Data APIs not Subscribed (Error 806). "
+                                       "Please activate the free Data API subscription on web.dhan.co -> DhanHQ APIs.")
+                if auth.auto_enabled(self.cfg) and not renewed:
+                    renewed = True                     # token expired mid-run: mint a new one once
+                    self.http.headers["access-token"] = auth.get_access_token(self.cfg, force=True)
+                    continue
             if resp.status_code == 429:               # rate limited: back off, retry
                 time.sleep(2 * (attempt + 1))
                 continue

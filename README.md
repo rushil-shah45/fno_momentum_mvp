@@ -56,11 +56,25 @@ project uses (`auth.py`):
 From then on the program creates a token itself, caches it in `data/token.json`, replaces it when
 less than 8 hours remain, and renews it automatically if Dhan answers 401 mid-session.
 
+### Manual login anytime
+
+If you come back after a long time and want to authenticate or refresh your token on demand:
+```bash
+python run.py --login
+```
+- If `.env` has your `DHAN_PIN` and `DHAN_TOTP_SECRET`, it automatically computes the TOTP code and logs in with zero prompts.
+- If not configured in `.env`, it will interactively prompt for your 6-digit Dhan PIN and your TOTP code (from your authenticator app).
+- You can also pass them directly via CLI flags:
+  ```bash
+  python run.py --login --pin 123456 --totp 654321
+  ```
+The new token is validated with Dhan and stored in `data/token.json` for all subsequent runs (`scan`, `trade`, `daemon`).
+
 Notes:
 - Your **PIN + TOTP secret are as sensitive as your password**. Keep `.env` private (it is gitignored) and never share it.
 - Your PC clock must be accurate (within about 30 seconds) or the TOTP codes will be rejected.
 - Generating a new token may stop an older token from working (Dhan's docs describe one active token for the API-key flow), so don't run other tools that use a separate manual token at the same time.
-- If you leave the PIN/secret empty, it falls back to `DHAN_ACCESS_TOKEN` and you are back to manual renewal.
+- If you leave the PIN/secret empty, it falls back to `data/token.json` or `DHAN_ACCESS_TOKEN`.
 
 ## Run once, automatic every day (recommended)
 

@@ -18,6 +18,7 @@ import time as _time
 from datetime import date, datetime, time, timedelta
 from logging.handlers import RotatingFileHandler
 
+import auth
 import run
 from settings import ROOT, load_settings
 from strategy import IST
@@ -88,10 +89,18 @@ def attempt(label: str, fn, until: time):
             raise
         except (Exception, SystemExit) as err:           # SystemExit: run.py's friendly stops
             log.error("%s failed: %s - retrying in %ds", label, err, RETRY_PAUSE)
-            if "401" in str(err) or "403" in str(err):
-                log.error("Authentication problem. With DHAN_PIN/DHAN_TOTP_SECRET set, token renewal is "
-                          "automatic - check those values and your PC clock. Otherwise update "
-                          "DHAN_ACCESS_TOKEN in .env.")
+            if "401" in str(err) or "403" in str(err) or "unauthorized" in str(err).lower():
+                log.error("Authentication problem detected (401 Unauthorized). Attempting to login again...")
+                try:
+                    s = load_settings()
+                    if s:
+                        auth.ensure_login(s, interactive=False, force_refresh=True)
+                        log.info("Successfully logged in again with Dhan.")
+                except Exception as login_err:
+                    log.error("Re-login failed: %s", login_err)
+                    log.error("With DHAN_PIN/DHAN_TOTP_SECRET set, token renewal is "
+                              "automatic - check those values and your PC clock. Otherwise update "
+                              "DHAN_ACCESS_TOKEN in .env.")
             _time.sleep(RETRY_PAUSE)
     log.error("%s: gave up (retry window closed)", label)
     return False, None
@@ -115,6 +124,13 @@ def write_summary(day: date, positions: list) -> None:
 def process_day(day: date) -> None:
     cfg = load_settings()
     sleep_until(at(day, UNIVERSE_AT))
+
+    # Verify / refresh Dhan login access for the day before operations begin
+    if cfg:
+        try:
+            auth.ensure_login(cfg, interactive=False)
+        except Exception as err:
+            log.warning("%s: daily login verification warning: %s", day, err)
 
     log.info("%s: refreshing universe", day)
     # An older universe file is fine if the refresh fails, but with no file at all
@@ -149,6 +165,22 @@ def run_forever() -> None:
     setup_logging()
     log.info("Scheduler started (paper only). Press Ctrl+C to stop.")
     cfg = load_settings()
+
+    # Check for Dhan login access immediately on startup
+    log.info("Checking Dhan login access...")
+    try:
+        token, expiry, profile = auth.ensure_login(cfg, interactive=True)
+        log.info("[✓] Dhan login access verified! (Client ID: %s, Expires: %s)",
+                 cfg.client_id, expiry.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry else "N/A")
+        if profile and profile.get("dataPlan") == "Deactive":
+            log.warning("Notice: Dhan Data API plan is 'Deactive' on this account. "
+                        "If quotes/scanning fails with Error 806, activate the free Data API on web.dhan.co.")
+    except Exception as err:
+        log.error("Dhan login access check failed: %s", err)
+        if "401" in str(err) or "unauth" in str(err).lower():
+            log.error("Authentication returned 401 Unauthorized. Set DHAN_PIN and DHAN_TOTP_SECRET in .env, "
+                      "or run `python run.py --login`.")
+
     if cfg.dashboard_enabled:
         try:
             import dashboard
