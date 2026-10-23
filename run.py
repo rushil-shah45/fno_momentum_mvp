@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from broker import Dhan, build_universe, load_master, option_contracts
+from broker import Dhan, ICICIDirect, build_universe, get_broker, load_master, option_contracts
 from settings import ROOT, Settings, load_settings
 from strategy import (IST, OpeningRange, Position, classify, fmt_time, open_position,
                       pick_atm, rank_movers, run_session)
@@ -64,9 +64,10 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 # --------------------------------------------------------------------- universe
 def cmd_universe(cfg: Settings) -> None:
-    rows = build_universe(load_master())
+    broker_name = "ICICI Direct" if cfg.active_broker in ("icici", "icicidirect") else "Dhan"
+    rows = build_universe(load_master(cfg), cfg)
     write_csv(DATA / "universe.csv", rows)
-    print(f"Universe: {len(rows)} F&O stocks -> data/universe.csv")
+    print(f"Universe ({broker_name}): {len(rows)} F&O stocks -> data/universe.csv")
 
 
 # ------------------------------------------------------------------------- scan
@@ -77,12 +78,12 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
     with uni_file.open(encoding="utf-8") as fh:
         universe = list(csv.DictReader(fh))
 
-    dhan, day = Dhan(cfg), today()
+    broker, day = get_broker(cfg), today()
     now = datetime.now(IST).time()
     # At 09:20-09:21 the 5-min OHLC is fully formed in one quote request.
     # Outside that window we fall back to ~1 request per stock (historical candles).
     live = not use_history and (now.hour, now.minute) in {(9, 20), (9, 21)}
-    quotes = dhan.quotes([u["security_id"] for u in universe])   # also gives prev close
+    quotes = broker.quotes([u["security_id"] for u in universe])   # also gives prev close
     if quotes_are_stale(quotes, datetime.now(IST)):
         raise NoMarketData("quotes are not from today (market holiday?)")
     print(f"Scanning {len(universe)} stocks ({'live snapshot' if live else 'historical candles'})...")
@@ -91,12 +92,12 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
     for u in universe:
         sid, q = u["security_id"], quotes.get(u["security_id"], {})
         try:
-            if live:
+            if live and q.get("ohlc"):
                 o = q["ohlc"]
                 rng = OpeningRange(float(o["open"]), float(o["high"]), float(o["low"]),
                                    float(q.get("last_price") or o["close"]), float(q.get("volume", 0)))
             else:
-                rng = dhan.stock_opening_range(sid, day)
+                rng = broker.stock_opening_range(sid, day)
             direction, reason, range_pct = classify(rng, cfg.tolerance, cfg.close_zone, cfg.max_range_pct)
             prev_close = float(q.get("ohlc", {}).get("close") or 0)
             last = float(q.get("last_price") or 0)
@@ -123,11 +124,11 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
 
 
 # ------------------------------------------------------------------------ trade
-def simulate_once(cfg: Settings, dhan: Dhan, movers: list[dict], picks: dict) -> list[Position]:
+def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> list[Position]:
     positions, later, skipped = [], {}, []
     for m in movers:
         contract = picks[m["symbol"]]
-        bars = dhan.option_candles(contract.security_id, today())
+        bars = broker.option_candles(contract.security_id, today())
         pos, rest, why = open_position(m["symbol"], m["direction"], contract, bars,
                                        cfg.max_risk_per_trade, cfg.enforce_risk_limit)
         if pos is None:
@@ -185,15 +186,15 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
     if not movers:
         raise SystemExit("No movers for today - run `python run.py scan` first.")
 
-    master, dhan = load_master(), Dhan(cfg)
+    master, broker = load_master(cfg), get_broker(cfg)
     picks = {}
     for m in movers:     # choose each ATM contract once, using the 5-min close as spot
         kind = "CE" if m["direction"] == "CALL" else "PE"
-        picks[m["symbol"]] = pick_atm(option_contracts(master, m["security_id"], kind),
+        picks[m["symbol"]] = pick_atm(option_contracts(master, m["security_id"], kind, cfg),
                                       m["close"], datetime.now(IST).date(), cfg.min_days_to_expiry)
 
     while True:
-        positions = simulate_once(cfg, dhan, movers, picks)
+        positions = simulate_once(cfg, broker, movers, picks)
         if not watch or datetime.now(IST).time() >= cfg.force_exit:
             return positions
         time.sleep(60)
@@ -201,26 +202,40 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
 
 def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None) -> None:
     from auth import login, check_access
-    print("Authenticating with Dhan...")
+    is_icici = cfg.active_broker in ("icici", "icicidirect")
+    broker_name = "ICICI Direct" if is_icici else "Dhan"
+    print(f"Authenticating with {broker_name}...")
     try:
         token, expiry = login(cfg, pin=pin, totp=totp)
     except Exception as e:
         raise SystemExit(f"Authentication failed: {e}")
     masked = f"{token[:8]}...{token[-6:]}" if len(token) > 14 else token
-    print("[✓] Dhan authentication successful!")
-    print(f"    Client ID : {cfg.client_id or 'provided'}")
-    print(f"    Token     : {masked}")
-    print(f"    Expires   : {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print("    Cached in : data/token.json")
+    print(f"[✓] {broker_name} authentication successful!")
+    if is_icici:
+        print(f"    User ID   : {cfg.icici_user_id or 'provided'}")
+        print(f"    Token     : {masked}")
+        print(f"    Expires   : {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        print("    Cached in : data/icici_token.json")
 
-    ok, status_code, msg, profile = check_access(token, cfg.client_id)
-    if ok:
-        print("[✓] Dhan API access verified.")
-        if profile and profile.get("dataPlan") == "Deactive":
-            print("[!] Notice: Dhan Data API plan is 'Deactive' on this account.")
-            print("    If market data scanning fails with Error 806, activate the free Data API on web.dhan.co -> DhanHQ APIs.")
+        ok, status_code, msg, profile = check_access(token, api_key=cfg.icici_api_key, api_secret=cfg.icici_api_secret, active_broker="icici")
+        if ok:
+            print("[✓] ICICI Direct Breeze API access verified.")
+        else:
+            print(f"[!] Warning: Access check returned HTTP {status_code} ({msg}).")
     else:
-        print(f"[!] Warning: Access check returned HTTP {status_code} ({msg}).")
+        print(f"    Client ID : {cfg.client_id or 'provided'}")
+        print(f"    Token     : {masked}")
+        print(f"    Expires   : {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        print("    Cached in : data/token.json")
+
+        ok, status_code, msg, profile = check_access(token, cfg.client_id)
+        if ok:
+            print("[✓] Dhan API access verified.")
+            if profile and profile.get("dataPlan") == "Deactive":
+                print("[!] Notice: Dhan Data API plan is 'Deactive' on this account.")
+                print("    If market data scanning fails with Error 806, activate the free Data API on web.dhan.co -> DhanHQ APIs.")
+        else:
+            print(f"[!] Warning: Access check returned HTTP {status_code} ({msg}).")
 
 
 def main() -> None:

@@ -17,16 +17,32 @@ def _read_env_file(path: Path) -> dict[str, str]:
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
-                values[key.strip()] = value.strip()
+                val = value.strip()
+                if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                    val = val[1:-1]
+                values[key.strip()] = val
     return values
 
 
 @dataclass(frozen=True)
 class Settings:
-    client_id: str
+    active_broker: str = "dhan"     # 'dhan' or 'icici'
+
+    # Dhan settings
+    client_id: str = ""
     access_token: str = ""          # manual fallback
     pin: str = ""                   # automatic tokens: Dhan 6-digit PIN
     totp_secret: str = ""           # automatic tokens: TOTP secret key
+
+    # ICICI Direct settings
+    icici_api_key: str = ""
+    icici_api_secret: str = ""
+    icici_user_id: str = ""
+    icici_password: str = ""
+    icici_totp_secret: str = ""
+    icici_session_token: str = ""   # manual fallback
+
+    # Risk controls
     max_risk_per_trade: float = 250.0
     max_daily_loss: float = 500.0
     force_exit: time = time(15, 0)
@@ -45,11 +61,19 @@ class Settings:
 def load_settings() -> Settings:
     env = {**_read_env_file(ROOT / ".env"), **os.environ}
     hh, mm = env.get("FORCE_EXIT", "15:00").split(":")
+    active_broker = env.get("ACTIVE_BROKER", env.get("BROKER", "dhan")).strip().lower()
     return Settings(
+        active_broker=active_broker,
         client_id=env.get("DHAN_CLIENT_ID", ""),
         access_token=env.get("DHAN_ACCESS_TOKEN", ""),
         pin=env.get("DHAN_PIN", ""),
         totp_secret=env.get("DHAN_TOTP_SECRET", ""),
+        icici_api_key=env.get("ICICI_API_KEY", ""),
+        icici_api_secret=env.get("ICICI_API_SECRET", ""),
+        icici_user_id=env.get("ICICI_USER_ID", ""),
+        icici_password=env.get("ICICI_PASSWORD", ""),
+        icici_totp_secret=env.get("ICICI_TOTP_SECRET", ""),
+        icici_session_token=env.get("ICICI_SESSION_TOKEN", ""),
         max_risk_per_trade=float(env.get("MAX_RISK_PER_TRADE", 250)),
         max_daily_loss=float(env.get("MAX_DAILY_LOSS", 500)),
         force_exit=time(int(hh), int(mm)),

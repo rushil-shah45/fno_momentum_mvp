@@ -1,7 +1,17 @@
 # F&O Opening-Range Momentum: Paper Trading MVP
 
 A small, Python-only (no JavaScript) paper-trading tool for NSE stock options.
-It reads Dhan market data and **cannot place orders**.
+It supports **Dhan** and **ICICI Direct (Breeze API)** and **cannot place orders** (read-only market data only).
+
+## Switching Brokers (`.env`)
+
+You can switch between brokers at any time using `ACTIVE_BROKER` in `.env`:
+
+```env
+ACTIVE_BROKER=dhan     # use DhanHQ API
+# or
+ACTIVE_BROKER=icici    # use ICICI Direct Breeze API
+```
 
 ## The idea
 
@@ -19,12 +29,12 @@ It reads Dhan market data and **cannot place orders**.
 ## Layout
 
 ```
-settings.py   config from .env
+settings.py   config from .env (including ACTIVE_BROKER switch)
 strategy.py   pure logic: classify, rank, pick ATM, Position, run_session (no network)
-broker.py     read-only Dhan client + instrument master
+broker.py     read-only Dhan & ICICI Direct clients + instrument masters
 run.py        CLI: universe | scan | trade | daemon | dashboard
 scheduler.py  run-once daily loop
-auth.py       automatic Dhan tokens (TOTP)
+auth.py       automatic login & session tokens for Dhan (TOTP) & ICICI (Playwright + TOTP)
 dashboard.py  web dashboard (no JavaScript)
 tests/        offline unit tests
 ```
@@ -33,25 +43,61 @@ tests/        offline unit tests
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # then add your Dhan Client ID and login details (see below)
-python -m unittest discover -s tests    # optional: verify the logic offline
+playwright install chromium             # required for ICICI automated login
+cp .env.example .env                    # add your broker credentials (see below)
+python -m unittest discover -s tests    # verify logic offline
 ```
 
-## No more manual access tokens (automatic login)
+## Broker Setup & Automatic Authentication
 
-Dhan access tokens expire after 24 hours, and the "Renew Token" API only works on a token that is still
-active, so it cannot revive an expired one. The reliable fix is Dhan's TOTP login endpoint, which this
-project uses (`auth.py`):
+### 1. Dhan Setup (`ACTIVE_BROKER=dhan`)
 
-1. Log in to Dhan Web, open **DhanHQ Trading APIs**, choose **Setup TOTP**, and confirm with the OTP.
-2. When the QR code appears, also copy the **text secret key** shown with it, and finish by entering the first code in an authenticator app.
-3. Put these in `.env`:
-   ```
-   DHAN_CLIENT_ID=...
-   DHAN_PIN=your 6-digit Dhan PIN
-   DHAN_TOTP_SECRET=the secret key from step 2
-   ```
-   Leave `DHAN_ACCESS_TOKEN` empty.
+Dhan access tokens expire after 24 hours. Put these in `.env`:
+
+```env
+ACTIVE_BROKER=dhan
+DHAN_CLIENT_ID=...
+DHAN_PIN=your 6-digit Dhan PIN
+DHAN_TOTP_SECRET=the secret key from Dhan Web > DhanHQ APIs > Setup TOTP
+```
+
+Leave `DHAN_ACCESS_TOKEN` empty. The bot mints fresh 24h tokens automatically.
+
+### 2. ICICI Direct Setup (`ACTIVE_BROKER=icici`)
+
+ICICI Direct Breeze API requires an App Key (API Key) and Secret Key from [api.icicidirect.com](https://api.icicidirect.com), plus daily session authentication:
+
+```env
+ACTIVE_BROKER=icici
+
+# 1. API App Credentials from api.icicidirect.com
+ICICI_API_KEY=your_api_app_key
+ICICI_API_SECRET=your_api_secret_key
+
+# 2. Automated morning login credentials (Playwright + TOTP)
+ICICI_USER_ID=your_icici_login_id
+ICICI_PASSWORD=your_icici_password
+ICICI_TOTP_SECRET=your_authenticator_totp_secret_seed
+
+# Optional: manual session token fallback (expires at midnight)
+ICICI_SESSION_TOKEN=
+```
+
+**How ICICI Auto-Login works in the morning:**
+
+- The bot launches headless Chromium via Playwright, navigates to `https://api.icicidirect.com/apiuser/login?api_key=...`.
+- Enters your `ICICI_USER_ID` and `ICICI_PASSWORD`.
+- Computes the 6-digit TOTP code dynamically from your `ICICI_TOTP_SECRET` and submits the 2FA form.
+- Captures the resulting session token (`apisession`) on redirect and saves it to `data/icici_token.json`.
+- All subsequent calls (`scan`, `trade`, `daemon`) use the cached session until expiry.
+
+### On-Demand Login (`python run.py --login`)
+
+To test or manually trigger authentication for whichever broker is currently set in `ACTIVE_BROKER`:
+
+```bash
+python run.py --login
+```
 
 From then on the program creates a token itself, caches it in `data/token.json`, replaces it when
 less than 8 hours remain, and renews it automatically if Dhan answers 401 mid-session.
@@ -59,18 +105,23 @@ less than 8 hours remain, and renews it automatically if Dhan answers 401 mid-se
 ### Manual login anytime
 
 If you come back after a long time and want to authenticate or refresh your token on demand:
+
 ```bash
 python run.py --login
 ```
+
 - If `.env` has your `DHAN_PIN` and `DHAN_TOTP_SECRET`, it automatically computes the TOTP code and logs in with zero prompts.
 - If not configured in `.env`, it will interactively prompt for your 6-digit Dhan PIN and your TOTP code (from your authenticator app).
 - You can also pass them directly via CLI flags:
+
   ```bash
   python run.py --login --pin 123456 --totp 654321
   ```
+
 The new token is validated with Dhan and stored in `data/token.json` for all subsequent runs (`scan`, `trade`, `daemon`).
 
 Notes:
+
 - Your **PIN + TOTP secret are as sensitive as your password**. Keep `.env` private (it is gitignored) and never share it.
 - Your PC clock must be accurate (within about 30 seconds) or the TOTP codes will be rejected.
 - Generating a new token may stop an older token from working (Dhan's docs describe one active token for the API-key flow), so don't run other tools that use a separate manual token at the same time.
@@ -85,7 +136,7 @@ python run.py daemon
 Leave it running. Every trading day it does the following by itself (IST):
 
 | Time | Action |
-|---|---|
+| --- | --- |
 | 09:00 | refresh the F&O universe |
 | 09:20:05 | scan and select the top movers |
 | 09:20 to 15:00 | paper-trade the ATM options, refreshing every minute |
@@ -128,7 +179,7 @@ If you run `scan` outside 09:20-09:21 it falls back to historical candles
 ## Differences from the original project
 
 | Original | This MVP |
-|---|---|
+| --- | --- |
 | Risk limits in `.env` were never used | `MAX_RISK_PER_TRADE` sizes lots (or skips the trade); `MAX_DAILY_LOSS` closes everything when breached |
 | Entry candle chosen by list position | Chosen by clock time, which is correct when an illiquid option has no 09:15 candle |
 | Epoch timestamps in CSVs | Readable `HH:MM:SS` IST |

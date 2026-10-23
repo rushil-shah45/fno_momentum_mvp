@@ -166,20 +166,22 @@ def run_forever() -> None:
     log.info("Scheduler started (paper only). Press Ctrl+C to stop.")
     cfg = load_settings()
 
-    # Check for Dhan login access immediately on startup
-    log.info("Checking Dhan login access...")
+    bname = "ICICI Direct" if cfg.active_broker in ("icici", "icicidirect") else "Dhan"
+    uid = cfg.icici_user_id if cfg.active_broker in ("icici", "icicidirect") else cfg.client_id
+
+    # Check for login access immediately on startup
+    log.info("Checking %s login access...", bname)
     try:
         token, expiry, profile = auth.ensure_login(cfg, interactive=True)
-        log.info("[✓] Dhan login access verified! (Client ID: %s, Expires: %s)",
-                 cfg.client_id, expiry.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry else "N/A")
+        log.info("[✓] %s login access verified! (ID: %s, Expires: %s)",
+                 bname, uid, expiry.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry else "N/A")
         if profile and profile.get("dataPlan") == "Deactive":
             log.warning("Notice: Dhan Data API plan is 'Deactive' on this account. "
                         "If quotes/scanning fails with Error 806, activate the free Data API on web.dhan.co.")
     except Exception as err:
-        log.error("Dhan login access check failed: %s", err)
+        log.error("%s login access check failed: %s", bname, err)
         if "401" in str(err) or "unauth" in str(err).lower():
-            log.error("Authentication returned 401 Unauthorized. Set DHAN_PIN and DHAN_TOTP_SECRET in .env, "
-                      "or run `python run.py --login`.")
+            log.error("Authentication returned 401 Unauthorized for %s. Check .env or run `python run.py --login`.", bname)
 
     if cfg.dashboard_enabled:
         try:
