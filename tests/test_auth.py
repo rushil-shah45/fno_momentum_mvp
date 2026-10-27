@@ -13,15 +13,15 @@ import auth
 from settings import Settings
 from strategy import IST
 
-AUTO = Settings(client_id="1", pin="123456", totp_secret="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
-MANUAL = Settings(client_id="1", access_token="manual-token")
+AUTO = Settings(indmoney_client_id="1", indmoney_mpin="123456", indmoney_totp_secret="GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+MANUAL = Settings(indmoney_client_id="1", indmoney_access_token="manual-token")
 
 
 class TotpTests(unittest.TestCase):
     def test_rfc6238_vector(self):
         # RFC 6238 appendix B: secret "12345678901234567890", T=59s, SHA-1 -> 94287082
-        self.assertEqual(auth.totp_now(AUTO.totp_secret, at=59, digits=8), "94287082")
-        self.assertEqual(auth.totp_now(AUTO.totp_secret, at=59), "287082")
+        self.assertEqual(auth.totp_now(AUTO.indmoney_totp_secret, at=59, digits=8), "94287082")
+        self.assertEqual(auth.totp_now(AUTO.indmoney_totp_secret, at=59), "287082")
 
     def test_tolerates_spaces_and_lowercase(self):
         spaced = "gezd gnbv gy3t qojq gezd gnbv gy3t qojq"
@@ -76,12 +76,11 @@ class TokenTests(unittest.TestCase):
     def test_other_client_cache_is_ignored(self):
         with mock.patch.object(auth, "generate_token", return_value=self.fresh(24)):
             auth.get_access_token(AUTO)
-        other = Settings(client_id="2", pin="1", totp_secret=AUTO.totp_secret)
+        other = Settings(indmoney_client_id="2", indmoney_mpin="1", indmoney_totp_secret=AUTO.indmoney_totp_secret)
         with mock.patch.object(auth, "generate_token", return_value=("other", datetime.now(IST) + timedelta(hours=24))):
             self.assertEqual(auth.get_access_token(other), "other")
 
     def test_manual_mode_uses_valid_cached_token(self):
-        # Even if pin/secret are not in Settings (manual), a valid cached token should be used
         auth._write_cache("1", "cached-token", datetime.now(IST) + timedelta(hours=10))
         self.assertEqual(auth.get_access_token(MANUAL), "cached-token")
 
@@ -90,16 +89,15 @@ class TokenTests(unittest.TestCase):
             ok = True
             status_code = 200
             def json(self):
-                return {"accessToken": "manual-login-token", "expiryTime": (datetime.now(IST) + timedelta(hours=24)).isoformat()}
+                return {"access_token": "manual-login-token", "expires_in": 86400}
 
         with mock.patch("requests.Session.post", return_value=FakeResp()) as post_mock:
-            token, expiry = auth.login(MANUAL, pin="654321", totp="123456")
+            token, expiry = auth.login(MANUAL, pin="654321", totp="123456", client_id="1")
             self.assertEqual(token, "manual-login-token")
-            # Verify the params sent
             _, kwargs = post_mock.call_args
-            self.assertEqual(kwargs["params"]["pin"], "654321")
-            self.assertEqual(kwargs["params"]["totp"], "123456")
-            # And verify it was cached
+            self.assertEqual(kwargs["json"]["mpin"], "654321")
+            self.assertEqual(kwargs["json"]["totp"], "123456")
+            self.assertEqual(kwargs["headers"]["x-api-key"], "1")
             self.assertEqual(auth.get_access_token(MANUAL), "manual-login-token")
 
 
@@ -118,15 +116,16 @@ class BrokerRenewTests(unittest.TestCase):
 
         tokens = iter(["old", "renewed"])
         with mock.patch.object(auth, "get_access_token", lambda cfg, force=False: next(tokens)):
-            dhan = broker.Dhan(AUTO)
+            ind = broker.INDMoney(AUTO)
             sent = []
 
-            def fake_post(url, json=None, timeout=None):
-                sent.append(dhan.http.headers["access-token"])
-                return Resp(401) if len(sent) == 1 else Resp(200, {"data": {"NSE_EQ": {}}})
+            def fake_get(url, params=None, timeout=None):
+                sent.append(ind.http.headers["Authorization"])
+                return Resp(401) if len(sent) == 1 else Resp(200, {"data": {"NSE_1": {"last_price": 100.0}}})
 
-            dhan.http.post = fake_post
-            self.assertEqual(dhan.quotes(["1"]), {})
+            ind.http.get = fake_get
+            res = ind.quotes(["1"])
+            self.assertIn("1", res)
         self.assertEqual(sent, ["old", "renewed"])
 
 
@@ -135,20 +134,20 @@ class CheckAccessTests(unittest.TestCase):
         class FakeResp:
             status_code = 200
             def json(self):
-                return {"dhanClientId": "1", "dataPlan": "Active"}
+                return {"status": "success", "data": {"name": "Test User", "client_id": "1"}}
 
         with mock.patch("requests.Session.get", return_value=FakeResp()):
             ok, code, msg, data = auth.check_access("tok", "1")
             self.assertTrue(ok)
             self.assertEqual(code, 200)
             self.assertEqual(msg, "Authenticated")
-            self.assertEqual(data["dhanClientId"], "1")
+            self.assertEqual(data["data"]["name"], "Test User")
 
     def test_401_returns_unauthorized(self):
         class FakeResp:
             status_code = 401
             def json(self):
-                return {"errorCode": "DH-901", "errorMessage": "Token expired"}
+                return {"error": "Token expired"}
 
         with mock.patch("requests.Session.get", return_value=FakeResp()):
             ok, code, msg, data = auth.check_access("bad-tok", "1")
@@ -174,18 +173,18 @@ class EnsureLoginTests(unittest.TestCase):
 
     def test_returns_cached_token_when_valid(self):
         auth._write_cache("1", "cached-tok", datetime.now(IST) + timedelta(hours=10))
-        with mock.patch.object(auth, "check_access", return_value=(True, 200, "Authenticated", {"dhanClientId": "1"})), \
+        with mock.patch.object(auth, "check_access", return_value=(True, 200, "Authenticated", {"client_id": "1"})), \
              mock.patch.object(auth, "generate_token") as gen:
             token, expiry, profile = auth.ensure_login(AUTO)
             self.assertEqual(token, "cached-tok")
-            self.assertEqual(profile["dhanClientId"], "1")
+            self.assertEqual(profile["client_id"], "1")
             self.assertEqual(gen.call_count, 0)
 
     def test_relocates_login_when_401_detected(self):
         auth._write_cache("1", "expired-tok", datetime.now(IST) + timedelta(hours=10))
         checks = [
             (False, 401, "Token expired", {}),                      # 1st check on cached token -> 401
-            (True, 200, "Authenticated", {"dhanClientId": "1"}),    # 2nd check on new token -> 200
+            (True, 200, "Authenticated", {"client_id": "1"}),       # 2nd check on new token -> 200
         ]
         fresh = ("brand-new-tok", datetime.now(IST) + timedelta(hours=24))
         with mock.patch.object(auth, "check_access", side_effect=checks), \
@@ -193,29 +192,8 @@ class EnsureLoginTests(unittest.TestCase):
             token, expiry, profile = auth.ensure_login(AUTO)
             self.assertEqual(token, "brand-new-tok")
             self.assertEqual(gen.call_count, 1)
-            # Verify cache was updated
             cached = auth._read_cache("1")
             self.assertEqual(cached[0], "brand-new-tok")
-
-
-class BrokerError806Tests(unittest.TestCase):
-    def test_806_raises_descriptive_runtime_error(self):
-        import broker
-
-        class Resp:
-            status_code = 401
-            text = '{"data":{"806":"Data APIs not Subscribed"},"status":"failed"}'
-            def raise_for_status(self):
-                raise RuntimeError("401")
-            def json(self):
-                return {}
-
-        with mock.patch.object(auth, "get_access_token", return_value="tok"):
-            dhan = broker.Dhan(AUTO)
-            dhan.http.post = lambda url, json=None, timeout=None: Resp()
-            with self.assertRaises(RuntimeError) as ctx:
-                dhan.quotes(["1"])
-            self.assertIn("Data APIs not Subscribed", str(ctx.exception))
 
 
 if __name__ == "__main__":

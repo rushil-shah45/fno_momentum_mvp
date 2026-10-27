@@ -1,11 +1,11 @@
 """Command-line entry point.
 
-    python run.py --login           # authenticate with Dhan (PIN + TOTP) & cache token
+    python run.py login             # authenticate with INDMoney (MPIN + TOTP) & cache token
     python run.py universe          # once a day (or week): list F&O stocks
     python run.py scan              # at ~09:20 IST: find setups + top movers
     python run.py trade             # after 09:20: paper-trade the movers' ATM options
     python run.py trade --watch     # same, refreshing every minute until force exit
-    python run.py daemon            # run ONCE; does all of the above every trading day
+    python run.py daemon            # run ONCE; does all of the above every trading day (08:55 login)
     python run.py dashboard         # web dashboard at http://127.0.0.1:8501
 """
 
@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from broker import Dhan, ICICIDirect, build_universe, get_broker, load_master, option_contracts
+from broker import INDMoney, ICICIDirect, build_universe, get_broker, load_master, option_contracts
 from settings import ROOT, Settings, load_settings
 from strategy import (IST, OpeningRange, Position, classify, fmt_time, open_position,
                       pick_atm, rank_movers, run_session)
@@ -64,7 +64,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 # --------------------------------------------------------------------- universe
 def cmd_universe(cfg: Settings) -> None:
-    broker_name = "ICICI Direct" if cfg.active_broker in ("icici", "icicidirect") else "Dhan"
+    broker_name = "ICICI Direct" if cfg.active_broker in ("icici", "icicidirect") else "INDMoney"
     rows = build_universe(load_master(cfg), cfg)
     write_csv(DATA / "universe.csv", rows)
     print(f"Universe ({broker_name}): {len(rows)} F&O stocks -> data/universe.csv")
@@ -200,11 +200,37 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
         time.sleep(60)
 
 
-def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None) -> None:
-    from auth import login, check_access
+def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None, force: bool = False) -> None:
+    from auth import login, check_access, _read_cache, _write_cache
+    from datetime import timedelta
     is_icici = cfg.active_broker in ("icici", "icicidirect")
-    broker_name = "ICICI Direct" if is_icici else "Dhan"
+    broker_name = "ICICI Direct" if is_icici else "INDMoney"
     print(f"Authenticating with {broker_name}...")
+
+    # For INDMoney, if not explicitly forcing a regeneration or overriding PIN/TOTP,
+    # test whether current cached or .env token is already authenticated and active:
+    if not is_icici and not force and not pin and not totp:
+        cached = _read_cache(cfg.indmoney_client_id) if cfg.indmoney_client_id else None
+        existing_token = (cached[0] if cached else None) or (cfg.indmoney_access_token if cfg else "")
+        if existing_token:
+            ok, status_code, msg, profile = check_access(existing_token, client_id=cfg.indmoney_client_id, active_broker="indmoney")
+            if ok:
+                expiry = cached[1] if cached else (datetime.now(IST) + timedelta(hours=23))
+                _write_cache(cfg.indmoney_client_id, existing_token, expiry)
+                masked = f"{existing_token[:8]}...{existing_token[-6:]}" if len(existing_token) > 14 else existing_token
+                print(f"[✓] Existing {broker_name} access token is valid and active!")
+                print(f"    Client ID : {cfg.indmoney_client_id or 'provided'}")
+                print(f"    Token     : {masked}")
+                print(f"    Expires   : {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                print("    Cached in : data/indmoney_token.json")
+                print(f"[✓] INDMoney API access verified.")
+                if profile and isinstance(profile, dict) and profile.get("data", {}).get("name"):
+                    print(f"    Account   : {profile['data']['name']}")
+                elif profile and isinstance(profile, dict) and profile.get("name"):
+                    print(f"    Account   : {profile['name']}")
+                print("    (Pass `python run.py login --force` to request a new token via MPIN+TOTP)")
+                return
+
     try:
         token, expiry = login(cfg, pin=pin, totp=totp)
     except Exception as e:
@@ -223,30 +249,33 @@ def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None) ->
         else:
             print(f"[!] Warning: Access check returned HTTP {status_code} ({msg}).")
     else:
-        print(f"    Client ID : {cfg.client_id or 'provided'}")
+        print(f"    Client ID : {cfg.indmoney_client_id or 'provided'}")
         print(f"    Token     : {masked}")
         print(f"    Expires   : {expiry.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-        print("    Cached in : data/token.json")
+        print("    Cached in : data/indmoney_token.json")
 
-        ok, status_code, msg, profile = check_access(token, cfg.client_id)
+        ok, status_code, msg, profile = check_access(token, client_id=cfg.indmoney_client_id, active_broker="indmoney")
         if ok:
-            print("[✓] Dhan API access verified.")
-            if profile and profile.get("dataPlan") == "Deactive":
-                print("[!] Notice: Dhan Data API plan is 'Deactive' on this account.")
-                print("    If market data scanning fails with Error 806, activate the free Data API on web.dhan.co -> DhanHQ APIs.")
+            print("[✓] INDMoney API access verified.")
+            if profile and isinstance(profile, dict) and profile.get("data", {}).get("name"):
+                print(f"    Account   : {profile['data']['name']}")
+            elif profile and isinstance(profile, dict) and profile.get("name"):
+                print(f"    Account   : {profile['name']}")
         else:
             print(f"[!] Warning: Access check returned HTTP {status_code} ({msg}).")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="F&O opening-range momentum - paper trading MVP")
-    parser.add_argument("--login", action="store_true", help="authenticate with Dhan (PIN + TOTP) and cache fresh access token")
-    parser.add_argument("--pin", type=str, default=None, help="6-digit Dhan PIN (optional, overrides .env)")
+    parser.add_argument("--login", action="store_true", help="authenticate with INDMoney / active broker (MPIN + TOTP) and cache fresh access token")
+    parser.add_argument("--force", action="store_true", help="force requesting a new token from broker even if cached/existing is valid")
+    parser.add_argument("--pin", type=str, default=None, help="INDMoney MPIN (optional, overrides .env)")
     parser.add_argument("--totp", type=str, default=None, help="6-digit TOTP code or secret (optional, overrides .env)")
 
     sub = parser.add_subparsers(dest="cmd", required=False)
-    login_cmd = sub.add_parser("login", help="authenticate with Dhan (PIN + TOTP) and cache fresh access token")
-    login_cmd.add_argument("--pin", type=str, default=None, help="6-digit Dhan PIN (optional, overrides .env)")
+    login_cmd = sub.add_parser("login", help="authenticate with INDMoney / active broker (MPIN + TOTP) and cache fresh access token")
+    login_cmd.add_argument("--force", action="store_true", help="force requesting a new token from broker even if cached/existing is valid")
+    login_cmd.add_argument("--pin", type=str, default=None, help="INDMoney MPIN (optional, overrides .env)")
     login_cmd.add_argument("--totp", type=str, default=None, help="6-digit TOTP code or secret (optional, overrides .env)")
 
     sub.add_parser("universe")
@@ -263,7 +292,8 @@ def main() -> None:
         cfg = load_settings()
         pin = getattr(args, "pin", None)
         totp = getattr(args, "totp", None)
-        cmd_login(cfg, pin=pin, totp=totp)
+        force = getattr(args, "force", False)
+        cmd_login(cfg, pin=pin, totp=totp, force=force)
         return
 
     if not args.cmd:

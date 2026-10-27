@@ -26,13 +26,13 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class Settings:
-    active_broker: str = "dhan"     # 'dhan' or 'icici'
+    active_broker: str = "indmoney"     # 'indmoney' or 'icici'
 
-    # Dhan settings
-    client_id: str = ""
-    access_token: str = ""          # manual fallback
-    pin: str = ""                   # automatic tokens: Dhan 6-digit PIN
-    totp_secret: str = ""           # automatic tokens: TOTP secret key
+    # INDMoney settings
+    indmoney_client_id: str = ""        # x-api-key header (Client ID from INDstocks TOTP setup)
+    indmoney_mpin: str = ""             # Account trading MPIN
+    indmoney_totp_secret: str = ""      # TOTP secret key for automatic 24h token renewal
+    indmoney_access_token: str = ""     # manual fallback: 24h access token from web dashboard
 
     # ICICI Direct settings
     icici_api_key: str = ""
@@ -61,13 +61,13 @@ class Settings:
 def load_settings() -> Settings:
     env = {**_read_env_file(ROOT / ".env"), **os.environ}
     hh, mm = env.get("FORCE_EXIT", "15:00").split(":")
-    active_broker = env.get("ACTIVE_BROKER", env.get("BROKER", "dhan")).strip().lower()
+    active_broker = env.get("ACTIVE_BROKER", env.get("BROKER", "indmoney")).strip().lower()
     return Settings(
         active_broker=active_broker,
-        client_id=env.get("DHAN_CLIENT_ID", ""),
-        access_token=env.get("DHAN_ACCESS_TOKEN", ""),
-        pin=env.get("DHAN_PIN", ""),
-        totp_secret=env.get("DHAN_TOTP_SECRET", ""),
+        indmoney_client_id=env.get("INDMONEY_CLIENT_ID", ""),
+        indmoney_mpin=env.get("INDMONEY_MPIN", env.get("INDMONEY_PIN", "")),
+        indmoney_totp_secret=env.get("INDMONEY_TOTP_SECRET", ""),
+        indmoney_access_token=env.get("INDMONEY_ACCESS_TOKEN", ""),
         icici_api_key=env.get("ICICI_API_KEY", ""),
         icici_api_secret=env.get("ICICI_API_SECRET", ""),
         icici_user_id=env.get("ICICI_USER_ID", ""),

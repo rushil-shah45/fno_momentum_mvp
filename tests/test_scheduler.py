@@ -62,25 +62,30 @@ class ProcessDayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.object(scheduler, "ROOT", Path(tmp)), \
              mock.patch.object(scheduler, "sleep_until", lambda t: None), \
-             mock.patch.object(scheduler, "now_ist", lambda: datetime(2026, 9, 25, 9, 1, tzinfo=IST)), \
+             mock.patch.object(scheduler, "now_ist", lambda: datetime(2026, 9, 25, 8, 50, tzinfo=IST)), \
+             mock.patch.object(run, "cmd_login", lambda c: order.append("login")), \
              mock.patch.object(run, "cmd_universe", lambda c: order.append("universe")), \
              mock.patch.object(run, "cmd_scan", lambda c, use_history: order.append("scan")), \
              mock.patch.object(run, "load_movers", lambda: movers_after_scan if "scan" in order else []), \
              mock.patch.object(run, "cmd_trade", lambda c, watch: order.append("trade") or []):
             scheduler.process_day(date(2026, 9, 25))
             summary = Path(tmp) / "data" / "daily_summary.csv"
-            rows = list(csv.reader(summary.open())) if summary.exists() else []
+            if summary.exists():
+                with summary.open() as f:
+                    rows = list(csv.reader(f))
+            else:
+                rows = []
         return order, rows
 
     def test_full_day_runs_in_order_and_writes_summary(self):
         order, rows = self.run_day([{"symbol": "X"}])
-        self.assertEqual(order, ["universe", "scan", "trade"])
+        self.assertEqual(order, ["login", "universe", "scan", "trade"])
         self.assertEqual(rows[0], ["date", "trades", "wins", "losses", "net_pnl"])
         self.assertEqual(rows[1][0], "2026-09-25")
 
     def test_no_movers_skips_trading(self):
         order, rows = self.run_day([])
-        self.assertEqual(order, ["universe", "scan"])
+        self.assertEqual(order, ["login", "universe", "scan"])
         self.assertEqual(rows, [])
 
 

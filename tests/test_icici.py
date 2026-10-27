@@ -87,9 +87,9 @@ class ICICIBrokerTests(unittest.TestCase):
                 self.assertIsInstance(b_icici, broker.ICICIDirect)
 
             with mock.patch.object(auth, "_read_cache", return_value=("tok", datetime.now())):
-                dhan_cfg = Settings(client_id="12345", access_token="tok")
-                b_dhan = broker.get_broker(dhan_cfg)
-                self.assertIsInstance(b_dhan, broker.Dhan)
+                ind_cfg = Settings(active_broker="indmoney", indmoney_client_id="12345", indmoney_access_token="tok")
+                b_ind = broker.get_broker(ind_cfg)
+                self.assertIsInstance(b_ind, broker.INDMoney)
 
     def test_build_icici_universe(self):
         mock_master = [

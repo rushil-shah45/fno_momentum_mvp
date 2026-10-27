@@ -1,16 +1,16 @@
 # F&O Opening-Range Momentum: Paper Trading MVP
 
 A small, Python-only (no JavaScript) paper-trading tool for NSE stock options.
-It supports **Dhan** and **ICICI Direct (Breeze API)** and **cannot place orders** (read-only market data only).
+It supports **INDMoney (INDstocks API)** and **ICICI Direct (Breeze API)** and **cannot place orders** (read-only market data only).
 
 ## Switching Brokers (`.env`)
 
 You can switch between brokers at any time using `ACTIVE_BROKER` in `.env`:
 
 ```env
-ACTIVE_BROKER=dhan     # use DhanHQ API
+ACTIVE_BROKER=indmoney     # use INDMoney (INDstocks API Suite - Free Data & Live Stream)
 # or
-ACTIVE_BROKER=icici    # use ICICI Direct Breeze API
+ACTIVE_BROKER=icici        # use ICICI Direct Breeze API
 ```
 
 ## The idea
@@ -31,10 +31,10 @@ ACTIVE_BROKER=icici    # use ICICI Direct Breeze API
 ```
 settings.py   config from .env (including ACTIVE_BROKER switch)
 strategy.py   pure logic: classify, rank, pick ATM, Position, run_session (no network)
-broker.py     read-only Dhan & ICICI Direct clients + instrument masters
-run.py        CLI: universe | scan | trade | daemon | dashboard
-scheduler.py  run-once daily loop
-auth.py       automatic login & session tokens for Dhan (TOTP) & ICICI (Playwright + TOTP)
+broker.py     read-only INDMoney & ICICI Direct clients + instrument masters
+run.py        CLI: login | universe | scan | trade | daemon | dashboard
+scheduler.py  run-once daily loop (runs login at 08:55 AM IST automatically)
+auth.py       automatic login & session tokens for INDMoney (TOTP) & ICICI (Playwright + TOTP)
 dashboard.py  web dashboard (no JavaScript)
 tests/        offline unit tests
 ```
@@ -43,25 +43,35 @@ tests/        offline unit tests
 
 ```bash
 pip install -r requirements.txt
-playwright install chromium             # required for ICICI automated login
+playwright install chromium             # required if using ICICI automated login
 cp .env.example .env                    # add your broker credentials (see below)
 python -m unittest discover -s tests    # verify logic offline
 ```
 
 ## Broker Setup & Automatic Authentication
 
-### 1. Dhan Setup (`ACTIVE_BROKER=dhan`)
+### 1. INDMoney Setup (`ACTIVE_BROKER=indmoney`)
 
-Dhan access tokens expire after 24 hours. Put these in `.env`:
+INDMoney (INDstocks) provides free market data APIs and WebSocket live streams. Tokens are valid for 24 hours. Put these in `.env`:
 
 ```env
-ACTIVE_BROKER=dhan
-DHAN_CLIENT_ID=...
-DHAN_PIN=your 6-digit Dhan PIN
-DHAN_TOTP_SECRET=the secret key from Dhan Web > DhanHQ APIs > Setup TOTP
+ACTIVE_BROKER=indmoney
+
+# 1. Your static Client ID (x-api-key) from INDstocks TOTP Setup:
+#    Log in to https://www.indstocks.com/app/api-trading/access-tokens -> Setup TOTP
+INDMONEY_CLIENT_ID=your_client_id
+
+# 2. Your INDstocks Account Trading MPIN (4 or 6-digit MPIN):
+INDMONEY_MPIN=your_account_mpin
+
+# 3. Your TOTP Secret Key (base32 string shown during Authenticator setup):
+INDMONEY_TOTP_SECRET=your_totp_secret_key
+
+# Optional: manual 24-hour access token fallback (from dashboard)
+INDMONEY_ACCESS_TOKEN=
 ```
 
-Leave `DHAN_ACCESS_TOKEN` empty. The bot mints fresh 24h tokens automatically.
+Leave `INDMONEY_ACCESS_TOKEN` empty when using automatic login (`MPIN` + `TOTP_SECRET`). The bot mints fresh 24h tokens automatically.
 
 ### 2. ICICI Direct Setup (`ACTIVE_BROKER=icici`)
 
@@ -83,49 +93,23 @@ ICICI_TOTP_SECRET=your_authenticator_totp_secret_seed
 ICICI_SESSION_TOKEN=
 ```
 
-**How ICICI Auto-Login works in the morning:**
-
-- The bot launches headless Chromium via Playwright, navigates to `https://api.icicidirect.com/apiuser/login?api_key=...`.
-- Enters your `ICICI_USER_ID` and `ICICI_PASSWORD`.
-- Computes the 6-digit TOTP code dynamically from your `ICICI_TOTP_SECRET` and submits the 2FA form.
-- Captures the resulting session token (`apisession`) on redirect and saves it to `data/icici_token.json`.
-- All subsequent calls (`scan`, `trade`, `daemon`) use the cached session until expiry.
-
-### On-Demand Login (`python run.py --login`)
+### On-Demand Login (`python run.py login`)
 
 To test or manually trigger authentication for whichever broker is currently set in `ACTIVE_BROKER`:
 
 ```bash
-python run.py --login
+python run.py login
 ```
 
-From then on the program creates a token itself, caches it in `data/token.json`, replaces it when
-less than 8 hours remain, and renews it automatically if Dhan answers 401 mid-session.
-
-### Manual login anytime
-
-If you come back after a long time and want to authenticate or refresh your token on demand:
-
-```bash
-python run.py --login
-```
-
-- If `.env` has your `DHAN_PIN` and `DHAN_TOTP_SECRET`, it automatically computes the TOTP code and logs in with zero prompts.
-- If not configured in `.env`, it will interactively prompt for your 6-digit Dhan PIN and your TOTP code (from your authenticator app).
+- If `.env` has your `INDMONEY_MPIN` and `INDMONEY_TOTP_SECRET`, it automatically computes the TOTP code and logs in with zero prompts.
+- If not configured in `.env`, it will interactively prompt for your MPIN and TOTP code.
 - You can also pass them directly via CLI flags:
 
   ```bash
-  python run.py --login --pin 123456 --totp 654321
+  python run.py login --pin 123456 --totp 654321
   ```
 
-The new token is validated with Dhan and stored in `data/token.json` for all subsequent runs (`scan`, `trade`, `daemon`).
-
-Notes:
-
-- Your **PIN + TOTP secret are as sensitive as your password**. Keep `.env` private (it is gitignored) and never share it.
-- Your PC clock must be accurate (within about 30 seconds) or the TOTP codes will be rejected.
-- Generating a new token may stop an older token from working (Dhan's docs describe one active token for the API-key flow), so don't run other tools that use a separate manual token at the same time.
-- If you leave the PIN/secret empty, it falls back to `data/token.json` or `DHAN_ACCESS_TOKEN`.
+The token is validated with INDMoney's `/user/profile` API and cached in `data/indmoney_token.json` for subsequent commands (`scan`, `trade`, `daemon`).
 
 ## Run once, automatic every day (recommended)
 
@@ -137,14 +121,15 @@ Leave it running. Every trading day it does the following by itself (IST):
 
 | Time | Action |
 | --- | --- |
-| 09:00 | refresh the F&O universe |
-| 09:20:05 | scan and select the top movers |
-| 09:20 to 15:00 | paper-trade the ATM options, refreshing every minute |
-| 15:00 | force-exit, append the day to `data/daily_summary.csv`, sleep until tomorrow |
+| **08:55:00** | **re-authenticate (`python run.py login`) to refresh token before market opens** |
+| **09:00:00** | refresh the F&O universe |
+| **09:20:05** | scan and select the top movers |
+| **09:20 to 15:00** | paper-trade the ATM options, refreshing every minute |
+| **15:00:00** | force-exit, append the day to `data/daily_summary.csv`, sleep until tomorrow |
 
-- **Weekends** are skipped automatically. **NSE holidays**: list them in `holidays.txt`. There is also a best-effort check that skips a day when the quotes are clearly from a previous day.
-- **Errors** (network, rate limits, bad token) are logged to `data/scanner.log` and retried every 60 seconds. One bad day never stops the scheduler.
-- **Token expiry:** with the automatic login above, tokens renew themselves. With a manual token, `.env` is re-read on every attempt, so paste a new `DHAN_ACCESS_TOKEN` while the daemon runs. No restart needed.
+- **Automatic Daily Re-authentication:** At **8:55 AM IST**, the scheduler executes `python run.py login` internally, minting and caching a fresh 24-hour token every trading day before universe fetching (09:00) and market open (09:15).
+- **Weekends** are skipped automatically. **NSE holidays**: list them in `holidays.txt`.
+- **Errors** (network, rate limits, bad token) are logged to `data/scanner.log` and retried every 60 seconds. If a 401 is encountered, it automatically logs in again.
 - **Restart-safe:** if you stop it and start it again mid-day, it reuses today's movers and carries on.
 - The computer must stay **on and awake** (disable sleep) and online. If you want it to start automatically after a reboot, add `python run.py daemon` to Windows Task Scheduler ("At log on").
 

@@ -1,6 +1,6 @@
-"""Automatic access tokens for Dhan and ICICI Direct (no manual copy-paste).
+"""Automatic access tokens for INDMoney and ICICI Direct (no manual copy-paste).
 
-- Dhan: client id + 6-digit PIN + TOTP code via official endpoint.
+- INDMoney: client id (x-api-key) + account MPIN + TOTP code via official endpoint (api.indstocks.com).
 - ICICI Direct: Breeze API session token via automated Playwright login (user_id + password + TOTP)
   or manual token fallback.
 """
@@ -25,10 +25,12 @@ from strategy import IST
 
 log = logging.getLogger("auth")
 
-# Dhan endpoints & cache
-AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
-PROFILE_URL = "https://api.dhan.co/v2/profile"
-CACHE = ROOT / "data" / "token.json"
+# INDMoney (INDstocks) endpoints & cache
+INDMONEY_BASE_URL = "https://api.indstocks.com"
+INDMONEY_TOKEN_URL = f"{INDMONEY_BASE_URL}/generate/token"
+INDMONEY_PROFILE_URL = f"{INDMONEY_BASE_URL}/user/profile"
+INDMONEY_CACHE = ROOT / "data" / "indmoney_token.json"
+CACHE = INDMONEY_CACHE  # default cache alias
 
 # ICICI endpoints & cache
 ICICI_CACHE = ROOT / "data" / "icici_token.json"
@@ -50,46 +52,109 @@ def totp_now(secret: str, at: float | None = None, digits: int = 6, step: int = 
 
 
 # ==============================================================================
-# Dhan Authentication
+# INDMoney Authentication
 # ==============================================================================
-def dhan_auto_enabled(cfg: Settings) -> bool:
-    return bool(cfg.pin and cfg.totp_secret)
+def indmoney_auto_enabled(cfg: Settings) -> bool:
+    return bool(cfg.indmoney_client_id and cfg.indmoney_mpin and cfg.indmoney_totp_secret)
 
 
-def generate_dhan_token(cfg: Settings) -> tuple[str, datetime]:
-    """Ask Dhan for a new 24h token. Never put the PIN or code in an error message."""
+def _extract_indmoney_token(data: any) -> str | None:
+    """Extract token string from various potential response formats from INDMoney."""
+    if isinstance(data, str):
+        s = data.strip()
+        return s if len(s) > 20 else None
+    if isinstance(data, dict):
+        for k in ("token", "access_token", "accessToken", "authToken", "jwt", "jwtToken", "session_token", "sessionToken"):
+            val = data.get(k)
+            if isinstance(val, str) and len(val.strip()) > 10:
+                return val.strip()
+        nested = data.get("data") or data.get("result") or data.get("response")
+        if isinstance(nested, str) and len(nested.strip()) > 20:
+            return nested.strip()
+        if isinstance(nested, dict):
+            for k in ("token", "access_token", "accessToken", "authToken", "jwt", "jwtToken", "session_token", "sessionToken"):
+                val = nested.get(k)
+                if isinstance(val, str) and len(val.strip()) > 10:
+                    return val.strip()
+    return None
+
+
+def generate_token(cfg: Settings, mpin: str | None = None, totp: str | None = None, client_id: str | None = None) -> tuple[str, datetime]:
+    """Ask INDMoney for a new 24h token. Never put the MPIN or code in an error message."""
+    cid = (client_id or (cfg.indmoney_client_id if cfg else "") or "").strip()
+    user_mpin = (mpin or (cfg.indmoney_mpin if cfg else "") or "").strip()
+    totp_secret = (totp or (cfg.indmoney_totp_secret if cfg else "") or "").strip()
+
+    if not cid:
+        raise RuntimeError("INDMoney Client ID is required (set INDMONEY_CLIENT_ID in .env).")
+    if not user_mpin:
+        raise RuntimeError("INDMoney MPIN is required (set INDMONEY_MPIN in .env).")
+    if not totp_secret:
+        raise RuntimeError("INDMoney TOTP secret or code is required (set INDMONEY_TOTP_SECRET in .env).")
+
+    cleaned = totp_secret.replace(" ", "").replace("-", "")
+    totp_code = cleaned if (cleaned.isdigit() and len(cleaned) == 6) else totp_now(cleaned)
+
     http = requests.Session()
     http.trust_env = False
+    headers = {
+        "x-api-key": cid,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "mpin": user_mpin,
+        "totp": totp_code,
+    }
+
     problem = "unknown error"
     for attempt in range(2):
-        resp = http.post(AUTH_URL, timeout=30, params={
-            "dhanClientId": cfg.client_id, "pin": cfg.pin,
-            "totp": totp_now(cfg.totp_secret)})
+        resp = http.post(INDMONEY_TOKEN_URL, headers=headers, json=payload, timeout=30)
         try:
             data = resp.json()
         except ValueError:
             data = {}
-        if resp.ok and data.get("accessToken"):
-            try:
-                expiry = datetime.fromisoformat(str(data["expiryTime"])).replace(tzinfo=IST)
-            except (KeyError, ValueError):
+
+        token = _extract_indmoney_token(data)
+        if resp.ok and token:
+            expires_in = data.get("expires_in") or data.get("expiresIn") or (data.get("data", {}) if isinstance(data.get("data"), dict) else {}).get("expires_in")
+            if expires_in:
+                expiry = datetime.now(IST) + timedelta(seconds=int(expires_in))
+            elif data.get("expiryTime") or data.get("expiry_time"):
+                exp_val = data.get("expiryTime") or data.get("expiry_time")
+                try:
+                    expiry = datetime.fromisoformat(str(exp_val).replace("Z", "+00:00")).astimezone(IST)
+                except (KeyError, ValueError):
+                    expiry = datetime.now(IST) + timedelta(hours=23)
+            else:
                 expiry = datetime.now(IST) + timedelta(hours=23)
-            return data["accessToken"], expiry
-        problem = f"HTTP {resp.status_code} {data.get('message') or data.get('errorMessage') or ''}".strip()
+            _write_cache(cid, token, expiry)
+            return token, expiry
+
+        problem = f"HTTP {resp.status_code} {data.get('message') or data.get('errorMessage') or data.get('error') or ''}".strip()
+        if resp.ok and not token:
+            keys = list(data.keys()) if isinstance(data, dict) else type(data)
+            problem = f"HTTP 200 token missing in response schema (keys: {keys})"
+
         if attempt == 0:
-            time.sleep(31)    # a TOTP code can't be reused; try again in the next 30s window
-    raise RuntimeError(f"Dhan token generation failed ({problem}). "
-                       "Check DHAN_PIN, DHAN_TOTP_SECRET and that your PC clock is accurate.")
+            wait_s = 65    # INDMoney strictly enforces at least 60s between token requests
+            print(f"[*] INDMoney cooldown active ({problem}). Waiting {wait_s}s before retrying with fresh TOTP...", flush=True)
+            time.sleep(wait_s)
+            totp_code = totp_now(cleaned) if not (cleaned.isdigit() and len(cleaned) == 6) else cleaned
+            payload["totp"] = totp_code
+
+    raise RuntimeError(f"INDMoney token generation failed ({problem}). "
+                       "Check INDMONEY_CLIENT_ID, INDMONEY_MPIN, INDMONEY_TOTP_SECRET and that your system clock is accurate.")
 
 
-# Backwards compatibility alias for Dhan tests
-generate_token = generate_dhan_token
+def generate_indmoney_token(cfg: Settings, mpin: str | None = None, totp: str | None = None, client_id: str | None = None) -> tuple[str, datetime]:
+    return generate_token(cfg, mpin=mpin, totp=totp, client_id=client_id)
 
 
 def _read_cache(client_id: str) -> tuple[str, datetime] | None:
     try:
         d = json.loads(CACHE.read_text(encoding="utf-8"))
-        if d["client_id"] == client_id:
+        if d.get("client_id") == client_id:
             return d["access_token"], datetime.fromisoformat(d["expiry"])
     except (OSError, ValueError, KeyError):
         pass
@@ -106,28 +171,28 @@ def _write_cache(client_id: str, token: str, expiry: datetime) -> None:
         pass
 
 
-def login_dhan(cfg: Settings, pin: str | None = None, totp: str | None = None, client_id: str | None = None) -> tuple[str, datetime]:
-    """Authenticate with Dhan using PIN and TOTP code/secret, and cache the token."""
-    cid = (client_id or (cfg.client_id if cfg else "") or "").strip()
+def login_indmoney(cfg: Settings, pin: str | None = None, totp: str | None = None, client_id: str | None = None) -> tuple[str, datetime]:
+    """Authenticate with INDMoney using Client ID (x-api-key), MPIN and TOTP, and cache the token."""
+    cid = (client_id or (cfg.indmoney_client_id if cfg else "") or "").strip()
     if not cid:
         if sys.stdin and sys.stdin.isatty():
-            cid = input("Enter Dhan Client ID: ").strip()
+            cid = input("Enter INDMoney Client ID (x-api-key): ").strip()
         else:
-            raise SystemExit("Dhan Client ID is required.")
+            raise SystemExit("INDMoney Client ID is required.")
     if not cid:
-        raise SystemExit("Dhan Client ID is required.")
+        raise SystemExit("INDMoney Client ID is required.")
 
-    user_pin = (pin or (cfg.pin if cfg else "") or "").strip()
+    user_pin = (pin or (cfg.indmoney_mpin if cfg else "") or "").strip()
     if not user_pin:
         if sys.stdin and sys.stdin.isatty():
             import getpass
-            user_pin = getpass.getpass("Enter 6-digit Dhan PIN: ").strip()
+            user_pin = getpass.getpass("Enter INDMoney Account MPIN: ").strip()
         else:
-            raise SystemExit("Dhan PIN is required.")
+            raise SystemExit("INDMoney MPIN is required.")
     if not user_pin:
-        raise SystemExit("Dhan PIN is required.")
+        raise SystemExit("INDMoney MPIN is required.")
 
-    code_or_secret = (totp or (cfg.totp_secret if cfg else "") or "").strip()
+    code_or_secret = (totp or (cfg.indmoney_totp_secret if cfg else "") or "").strip()
     if not code_or_secret:
         if sys.stdin and sys.stdin.isatty():
             code_or_secret = input("Enter 6-digit TOTP code (from authenticator app) or TOTP secret: ").strip()
@@ -136,104 +201,80 @@ def login_dhan(cfg: Settings, pin: str | None = None, totp: str | None = None, c
     if not code_or_secret:
         raise SystemExit("TOTP code or secret is required.")
 
-    cleaned = code_or_secret.replace(" ", "").replace("-", "")
-    if cleaned.isdigit() and len(cleaned) == 6:
-        totp_code = cleaned
-    else:
-        totp_code = totp_now(cleaned)
-
-    http = requests.Session()
-    http.trust_env = False
-    resp = http.post(AUTH_URL, timeout=30, params={
-        "dhanClientId": cid,
-        "pin": user_pin,
-        "totp": totp_code,
-    })
-    try:
-        data = resp.json()
-    except ValueError:
-        data = {}
-
-    if resp.ok and data.get("accessToken"):
-        try:
-            expiry = datetime.fromisoformat(str(data["expiryTime"])).replace(tzinfo=IST)
-        except (KeyError, ValueError):
-            expiry = datetime.now(IST) + timedelta(hours=23)
-        _write_cache(cid, data["accessToken"], expiry)
-        return data["accessToken"], expiry
-
-    problem = f"HTTP {resp.status_code} {data.get('message') or data.get('errorMessage') or ''}".strip()
-    raise RuntimeError(f"Dhan login failed ({problem}).")
+    return generate_indmoney_token(cfg, mpin=user_pin, totp=code_or_secret, client_id=cid)
 
 
-def check_dhan_access(token: str, client_id: str = "") -> tuple[bool, int, str, dict]:
-    """Test token validity against Dhan's profile endpoint.
+def check_indmoney_access(token: str, client_id: str = "") -> tuple[bool, int, str, dict]:
+    """Test token validity against INDMoney's user profile endpoint.
     Returns (ok, status_code, message, profile_dict)."""
     if not token:
         return False, 401, "No token provided", {}
     http = requests.Session()
     http.trust_env = False
-    headers = {"access-token": token}
-    if client_id:
-        headers["client-id"] = client_id
+    headers = {
+        "Authorization": token,
+        "Accept": "application/json",
+    }
     try:
-        resp = http.get(PROFILE_URL, headers=headers, timeout=15)
+        resp = http.get(INDMONEY_PROFILE_URL, headers=headers, timeout=15)
         try:
             data = resp.json()
         except Exception:
             data = {}
         if resp.status_code == 200:
             return True, 200, "Authenticated", data
-        msg = data.get("errorMessage") or data.get("message") or f"HTTP {resp.status_code}"
+        msg = data.get("errorMessage") or data.get("message") or data.get("error") or f"HTTP {resp.status_code}"
         return False, resp.status_code, str(msg), data
     except Exception as err:
         return False, 0, str(err), {}
 
 
-def get_dhan_access_token(cfg: Settings, force: bool = False) -> str:
+def get_indmoney_access_token(cfg: Settings, force: bool = False) -> str:
     """Return a usable access token, creating a new one only when needed."""
-    cached = _read_cache(cfg.client_id)
+    cid = cfg.indmoney_client_id if cfg else ""
+    cached = _read_cache(cid)
     now = datetime.now(IST)
     if cached and not force and cached[1] - now > MIN_REMAINING:
         return cached[0]
 
-    if dhan_auto_enabled(cfg):
+    if indmoney_auto_enabled(cfg):
         try:
             token, expiry = generate_token(cfg)
         except Exception:
             if cached and cached[1] > now and not force:   # new token failed, old one still works
                 return cached[0]
             raise
-        _write_cache(cfg.client_id, token, expiry)
+        _write_cache(cid, token, expiry)
         return token
 
     if cached and cached[1] > now and not force:
         return cached[0]
 
-    return cfg.access_token                      # manual mode
+    return cfg.indmoney_access_token                      # manual mode
 
 
-def ensure_dhan_login(cfg: Settings, interactive: bool = True, force_refresh: bool = False) -> tuple[str, datetime, dict]:
+def ensure_indmoney_login(cfg: Settings, interactive: bool = True, force_refresh: bool = False) -> tuple[str, datetime, dict]:
     if not cfg:
         raise ValueError("Settings object is required.")
 
-    cached = _read_cache(cfg.client_id)
-    token = cached[0] if cached else cfg.access_token
+    cid = cfg.indmoney_client_id
+    cached = _read_cache(cid)
+    token = cached[0] if cached else cfg.indmoney_access_token
     expiry = cached[1] if cached else (datetime.now(IST) + timedelta(hours=23))
 
     need_login = force_refresh or not token
 
     if not need_login:
-        ok, status_code, msg, profile = check_access(token, cfg.client_id)
+        ok, status_code, msg, profile = check_access(token, client_id=cid, active_broker="indmoney")
         if ok:
             now = datetime.now(IST)
-            if cached and dhan_auto_enabled(cfg) and (cached[1] - now < MIN_REMAINING):
+            if cached and indmoney_auto_enabled(cfg) and (cached[1] - now < MIN_REMAINING):
                 log.info("Token valid but expiring within %s, refreshing...", MIN_REMAINING)
                 need_login = True
             else:
                 return token, expiry, profile
         elif status_code == 401:
-            log.warning("Dhan access check returned 401 Unauthorized (%s). Logging in again...", msg)
+            log.warning("INDMoney access check returned 401 Unauthorized (%s). Logging in again...", msg)
             need_login = True
         else:
             if cached and cached[1] > datetime.now(IST):
@@ -241,20 +282,20 @@ def ensure_dhan_login(cfg: Settings, interactive: bool = True, force_refresh: bo
             need_login = True
 
     if need_login:
-        if dhan_auto_enabled(cfg):
-            log.info("Authenticating with Dhan (PIN + TOTP)...")
+        if indmoney_auto_enabled(cfg):
+            log.info("Authenticating with INDMoney (MPIN + TOTP)...")
             token, expiry = generate_token(cfg)
-            _write_cache(cfg.client_id, token, expiry)
+            _write_cache(cid, token, expiry)
         elif interactive and sys.stdin and sys.stdin.isatty():
             log.info("Interactive login required...")
-            token, expiry = login(cfg)
+            token, expiry = login_indmoney(cfg)
         else:
-            raise RuntimeError("Dhan 401 Unauthorized: token expired or invalid, and automatic "
-                               "credentials (DHAN_PIN/DHAN_TOTP_SECRET) are not configured.")
+            raise RuntimeError("INDMoney 401 Unauthorized: token expired or missing, and automatic "
+                               "credentials (INDMONEY_CLIENT_ID, INDMONEY_MPIN, INDMONEY_TOTP_SECRET) are not configured.")
 
-        ok, status_code, msg, profile = check_access(token, cfg.client_id)
+        ok, status_code, msg, profile = check_access(token, client_id=cid, active_broker="indmoney")
         if not ok and status_code == 401:
-            raise RuntimeError(f"Dhan login succeeded but access check returned 401 Unauthorized ({msg}).")
+            raise RuntimeError(f"INDMoney login succeeded but access check returned 401 Unauthorized ({msg}).")
         return token, expiry, profile
 
 
@@ -552,13 +593,13 @@ def ensure_icici_login(cfg: Settings, interactive: bool = True, force_refresh: b
 def auto_enabled(cfg: Settings) -> bool:
     if cfg and cfg.active_broker in ("icici", "icicidirect"):
         return icici_auto_enabled(cfg)
-    return dhan_auto_enabled(cfg)
+    return indmoney_auto_enabled(cfg)
 
 
 def get_access_token(cfg: Settings, force: bool = False) -> str:
     if cfg and cfg.active_broker in ("icici", "icicidirect"):
         return get_icici_session_token(cfg, force=force)
-    return get_dhan_access_token(cfg, force=force)
+    return get_indmoney_access_token(cfg, force=force)
 
 
 def login(cfg: Settings, pin: str | None = None, totp: str | None = None, client_id: str | None = None,
@@ -567,16 +608,16 @@ def login(cfg: Settings, pin: str | None = None, totp: str | None = None, client
     if cfg and cfg.active_broker in ("icici", "icicidirect"):
         return login_icici(cfg, session_token=session_token, user_id=user_id, password=password,
                            totp=totp, api_key=api_key, api_secret=api_secret)
-    return login_dhan(cfg, pin=pin, totp=totp, client_id=client_id)
+    return login_indmoney(cfg, pin=pin, totp=totp, client_id=client_id)
 
 
-def check_access(token: str, client_id: str = "", api_key: str = "", api_secret: str = "", active_broker: str = "dhan") -> tuple[bool, int, str, dict]:
+def check_access(token: str, client_id: str = "", api_key: str = "", api_secret: str = "", active_broker: str = "indmoney") -> tuple[bool, int, str, dict]:
     if active_broker in ("icici", "icicidirect") or (api_key and api_secret):
         return check_icici_access(token, api_key=api_key or client_id, api_secret=api_secret)
-    return check_dhan_access(token, client_id=client_id)
+    return check_indmoney_access(token, client_id=client_id)
 
 
 def ensure_login(cfg: Settings, interactive: bool = True, force_refresh: bool = False) -> tuple[str, datetime, dict]:
     if cfg and cfg.active_broker in ("icici", "icicidirect"):
         return ensure_icici_login(cfg, interactive=interactive, force_refresh=force_refresh)
-    return ensure_dhan_login(cfg, interactive=interactive, force_refresh=force_refresh)
+    return ensure_indmoney_login(cfg, interactive=interactive, force_refresh=force_refresh)
