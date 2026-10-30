@@ -124,7 +124,7 @@ Leave it running. Every trading day it does the following by itself (IST):
 | **08:55:00** | **re-authenticate (`python run.py login`) to refresh token before market opens** |
 | **09:00:00** | refresh the F&O universe |
 | **09:20:05** | scan and select the top movers |
-| **09:20 to 15:00** | paper-trade the ATM options, refreshing every minute |
+| **09:20 to 15:00** | paper-trade the ATM options, streaming live in real-time via WebSockets (instant stop-loss) |
 | **15:00:00** | force-exit, append the day to `data/daily_summary.csv`, sleep until tomorrow |
 
 - **Automatic Daily Re-authentication:** At **8:55 AM IST**, the scheduler executes `python run.py login` internally, minting and caching a fresh 24-hour token every trading day before universe fetching (09:00) and market open (09:15).

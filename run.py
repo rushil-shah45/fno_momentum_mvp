@@ -14,14 +14,16 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from broker import INDMoney, ICICIDirect, build_universe, get_broker, load_master, option_contracts
+from broker import (INDMoney, ICICIDirect, build_universe, get_broker, get_stream,
+                    load_master, option_contracts)
 from settings import ROOT, Settings, load_settings
-from strategy import (IST, OpeningRange, Position, classify, fmt_time, open_position,
-                      pick_atm, rank_movers, run_session)
+from strategy import (IST, CandleAggregator, OpeningRange, Position, classify, fmt_time,
+                      open_position, pick_atm, rank_movers, run_session)
 
 DATA = ROOT / "data"
 
@@ -77,6 +79,13 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
         raise SystemExit("Run `python run.py universe` first.")
     with uni_file.open(encoding="utf-8") as fh:
         universe = list(csv.DictReader(fh))
+
+    # Auto-heal legacy universe files containing truncated symbols (BAJAJ/NAM) or option tokens
+    if any(u.get("symbol") in ("BAJAJ", "NAM") or u.get("security_id") in ("74928", "115385", "56598", "138474") for u in universe):
+        print("Detected outdated universe file with legacy tokens. Re-generating data/universe.csv...")
+        cmd_universe(cfg)
+        with uni_file.open(encoding="utf-8") as fh:
+            universe = list(csv.DictReader(fh))
 
     broker, day = get_broker(cfg), today()
     now = datetime.now(IST).time()
@@ -181,6 +190,127 @@ def load_movers() -> list[dict]:
         return [{**r, "close": float(r["close"])} for r in csv.DictReader(fh)]
 
 
+class LiveTradeSession:
+    """Manages real-time WebSocket watching, tick-by-tick stops, candle aggregation, and live P&L updates."""
+
+    def __init__(self, cfg: Settings, broker, movers: list[dict], picks: dict,
+                 initial_positions: list[Position]):
+        self.cfg = cfg
+        self.broker = broker
+        self.movers = movers
+        self.picks = picks
+        self.positions = initial_positions
+        self.aggregator = CandleAggregator(interval_seconds=300)
+        self.lock = threading.Lock()
+        self.last_csv_write = 0.0
+        self.last_tick_time = time.time()
+        self.stream = None
+        self.skipped: list[tuple[str, str]] = []
+
+        # Map security_id variants to symbol
+        self.sec_id_to_symbol: dict[str, str] = {}
+        for sym, c in picks.items():
+            sid = c.security_id
+            self.sec_id_to_symbol[sid] = sym
+            self.sec_id_to_symbol[sid.replace(":", "_")] = sym
+            self.sec_id_to_symbol[sid.replace("_", ":")] = sym
+            if ":" in sid:
+                self.sec_id_to_symbol[sid.split(":")[0]] = sym
+                self.sec_id_to_symbol[sid.split(":")[-1]] = sym
+            if "_" in sid:
+                self.sec_id_to_symbol[sid.split("_")[-1]] = sym
+
+    def _get_position(self, symbol: str) -> Position | None:
+        for p in self.positions:
+            if p.symbol == symbol:
+                return p
+        return None
+
+    def _persist(self) -> None:
+        write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in self.positions])
+
+    def on_tick(self, sec_id: str, price: float, ts: int) -> None:
+        with self.lock:
+            self.last_tick_time = time.time()
+            sym = self.sec_id_to_symbol.get(sec_id)
+            if not sym:
+                clean = sec_id.replace("NFO:", "").replace("NSE:", "").replace("NFO_", "").replace("NSE_", "")
+                sym = self.sec_id_to_symbol.get(clean)
+            if not sym and len(self.picks) == 1:
+                sym = list(self.picks.keys())[0]
+            if not sym:
+                return
+
+            pos = self._get_position(sym)
+            if pos and pos.status == "OPEN":
+                # Instant tick-level stop-loss check
+                closed = pos.on_tick(price, ts)
+                if closed:
+                    print(f"\n[WS STOP] {pos.symbol} stop loss hit at {price:.2f} (Stop: {pos.stop:.2f})")
+                    self._persist()
+
+            # Aggregate tick into 5-minute candle
+            completed_bar = self.aggregator.add_tick(sym, price, ts)
+            if completed_bar:
+                if pos and pos.status == "OPEN":
+                    pos.on_bar(completed_bar)
+                    self._persist()
+
+            # Shared daily loss limit check
+            if sum(p.pnl for p in self.positions) <= -self.cfg.max_daily_loss:
+                for p in self.positions:
+                    if p.status == "OPEN":
+                        p.close(p.last_price, ts, "EXIT_DAILY_LOSS")
+                self._persist()
+
+            # Periodically write trades.csv so dashboard reflects live tick P&L
+            now = time.time()
+            if now - self.last_csv_write > 5.0:
+                self._persist()
+                self.last_csv_write = now
+
+    def run(self) -> list[Position]:
+        contracts = list(self.picks.values())
+        try:
+            self.stream = get_stream(self.broker, contracts, on_tick=self.on_tick)
+            self.stream.start()
+            print(f"\n[WS] WebSocket live stream active for {len(contracts)} contracts.")
+            print("[WS] Watching positions in real-time (instant stop-loss active)...")
+        except Exception as err:
+            print(f"\n[WS] WebSocket streaming unavailable ({err}). Falling back to REST polling.")
+            return self._fallback_polling()
+
+        try:
+            while datetime.now(IST).time() < self.cfg.force_exit:
+                time.sleep(1)
+                # If no ticks received for 90s, re-check or sync via REST
+                if time.time() - self.last_tick_time > 90:
+                    self.last_tick_time = time.time()
+                    try:
+                        self.positions = simulate_once(self.cfg, self.broker, self.movers, self.picks)
+                    except Exception:
+                        pass
+        finally:
+            if self.stream:
+                self.stream.stop()
+
+        with self.lock:
+            now_ts = int(datetime.now(IST).timestamp())
+            for p in self.positions:
+                if p.status == "OPEN":
+                    p.close(p.last_price, now_ts, "EXIT_FORCED")
+            self._persist()
+            print_report(self.positions, self.skipped, "force-exit time reached")
+        return self.positions
+
+    def _fallback_polling(self) -> list[Position]:
+        while True:
+            self.positions = simulate_once(self.cfg, self.broker, self.movers, self.picks)
+            if datetime.now(IST).time() >= self.cfg.force_exit:
+                return self.positions
+            time.sleep(60)
+
+
 def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
     movers = load_movers()
     if not movers:
@@ -193,11 +323,13 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
         picks[m["symbol"]] = pick_atm(option_contracts(master, m["security_id"], kind, cfg),
                                       m["close"], datetime.now(IST).date(), cfg.min_days_to_expiry)
 
-    while True:
-        positions = simulate_once(cfg, broker, movers, picks)
-        if not watch or datetime.now(IST).time() >= cfg.force_exit:
-            return positions
-        time.sleep(60)
+    # Initial state computed from available historical candles
+    positions = simulate_once(cfg, broker, movers, picks)
+    if not watch or datetime.now(IST).time() >= cfg.force_exit:
+        return positions
+
+    session = LiveTradeSession(cfg, broker, movers, picks, positions)
+    return session.run()
 
 
 def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None, force: bool = False) -> None:

@@ -81,10 +81,15 @@ def at(day: date, clock: time) -> datetime:
     return datetime.combine(day, clock, tzinfo=IST)
 
 
-def attempt(label: str, fn, until: time):
+def attempt(label: str, fn, until: time, run_once_if_past: bool = False):
     """Run fn(cfg) until it succeeds or `until` passes. Settings are re-read each
     try (so a fixed .env/token is picked up). Returns (ok, result)."""
-    while now_ist().time() < until:
+    first_try = True
+    while first_try or now_ist().time() < until:
+        if not (now_ist().time() < until):
+            if not (first_try and run_once_if_past):
+                break
+        first_try = False
         try:
             return True, fn(load_settings())
         except run.NoMarketData:
@@ -140,8 +145,21 @@ def process_day(day: date) -> None:
 
     cfg = load_settings()
     log.info("%s: refreshing universe", day)
-    have_universe = (run.DATA / "universe.csv").exists()
-    attempt("universe", run.cmd_universe, until=time(9, 15) if have_universe else SCAN_RETRY_UNTIL)
+    uni_path = run.DATA / "universe.csv"
+    fresh_today = False
+    if uni_path.exists():
+        try:
+            mtime = datetime.fromtimestamp(uni_path.stat().st_mtime, IST).date()
+            if mtime == day:
+                with uni_path.open(encoding="utf-8") as fh:
+                    rows = list(csv.DictReader(fh))
+                    if not any(r.get("symbol") in ("BAJAJ", "NAM") or r.get("security_id") in ("74928", "115385") for r in rows):
+                        fresh_today = True
+        except Exception:
+            pass
+
+    attempt("universe", run.cmd_universe, until=time(9, 15) if fresh_today else SCAN_RETRY_UNTIL,
+            run_once_if_past=not fresh_today)
 
     sleep_until(at(day, SCAN_AT))
     if not run.load_movers():

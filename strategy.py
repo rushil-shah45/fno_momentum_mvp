@@ -140,6 +140,19 @@ class Position:
     def close(self, price: float, ts: int, status: str) -> None:
         self.exit_price, self.exit_ts, self.status = price, ts, status
 
+    def on_tick(self, price: float, ts: int) -> bool:
+        """Advance one tick. We always BUY options, so if a tick falls to or below
+        the current stop, trigger an immediate exit.
+        Returns True if the position was closed on this tick.
+        """
+        if self.status != "OPEN":
+            return False
+        self.last_price = price
+        if price <= self.stop:
+            self.close(self.stop, ts, "EXIT_STOP")
+            return True
+        return False
+
     def on_bar(self, bar: Bar) -> None:
         """Advance one 5-minute option candle. We always BUY options, so a stop
         sits below price and triggers when the bar's low touches it.
@@ -162,6 +175,44 @@ class Position:
             new_stop = bar.low - 1.0
             if new_stop > self.stop:
                 self.stop = new_stop
+
+
+class CandleAggregator:
+    """Aggregates incoming ticks into interval-aligned Bars (default 5-minute = 300s)."""
+
+    def __init__(self, interval_seconds: int = 300):
+        self.interval = interval_seconds
+        self.current_bars: dict[str, Bar] = {}
+
+    def add_tick(self, symbol: str, price: float, ts: int, volume: float = 0.0) -> Bar | None:
+        """Add a tick for a symbol. If a new candle bucket has started, returns the completed Bar."""
+        bucket_ts = (ts // self.interval) * self.interval
+        curr = self.current_bars.get(symbol)
+        completed = None
+
+        if curr is None:
+            self.current_bars[symbol] = Bar(
+                ts=bucket_ts, open=price, high=price, low=price, close=price, volume=volume
+            )
+        elif curr.ts == bucket_ts:
+            self.current_bars[symbol] = Bar(
+                ts=curr.ts,
+                open=curr.open,
+                high=max(curr.high, price),
+                low=min(curr.low, price),
+                close=price,
+                volume=curr.volume + volume,
+            )
+        else:
+            completed = curr
+            self.current_bars[symbol] = Bar(
+                ts=bucket_ts, open=price, high=price, low=price, close=price, volume=volume
+            )
+        return completed
+
+    def get_bar(self, symbol: str) -> Bar | None:
+        """Return the current in-progress Bar for the symbol."""
+        return self.current_bars.get(symbol)
 
 
 def open_position(symbol: str, direction: str, contract: Contract, bars: list[Bar],

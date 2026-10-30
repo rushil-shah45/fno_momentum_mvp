@@ -6,10 +6,12 @@ import csv
 import io
 import json
 import logging
+import threading
 import time
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
+from typing import Callable
 
 import requests
 
@@ -59,7 +61,19 @@ class INDMoney:
             if resp.status_code == 429:               # rate limited: back off, retry
                 time.sleep(2 * (attempt + 1))
                 continue
-            resp.raise_for_status()
+            is_ok = getattr(resp, "ok", resp.status_code < 400)
+            if not is_ok:
+                err_text = ""
+                try:
+                    err_text = resp.text
+                except Exception:
+                    pass
+                try:
+                    resp.raise_for_status()
+                except requests.HTTPError as ex:
+                    if err_text:
+                        raise requests.HTTPError(f"{ex} - Response: {err_text}", response=resp) from ex
+                    raise
             return resp.json()
         raise RuntimeError("INDMoney rate limit: too many retries")
 
@@ -70,6 +84,27 @@ class INDMoney:
         if not security_ids:
             return out
 
+        def _fetch_chunk(scrips: list[str]) -> dict:
+            if not scrips:
+                return {}
+            scrip_param = ",".join(scrips)
+            try:
+                res = self._get("/market/quotes/full", params={"scrip-codes": scrip_param})
+                return res.get("data", res) if isinstance(res, dict) else {}
+            except Exception as err:
+                if len(scrips) > 1 and ("400" in str(err) or "bad request" in str(err).lower()):
+                    # INDstocks rejects entire batch if even a single scrip is invalid.
+                    # Bisect and fetch each half recursively to salvage all valid quotes.
+                    mid = len(scrips) // 2
+                    left = _fetch_chunk(scrips[:mid])
+                    right = _fetch_chunk(scrips[mid:])
+                    merged = dict(left)
+                    merged.update(right)
+                    return merged
+                log.warning("INDMoney quotes fetch error for %s: %s",
+                            scrips if len(scrips) <= 3 else f"{len(scrips)} scrips", err)
+                return {}
+
         chunk_size = 100
         for i in range(0, len(security_ids), chunk_size):
             chunk = security_ids[i:i + chunk_size]
@@ -77,14 +112,7 @@ class INDMoney:
                 s if ("_" in str(s) or ":" in str(s)) else f"NSE_{s}"
                 for s in chunk
             ]
-            scrip_param = ",".join(formatted_scrips)
-            try:
-                res = self._get("/market/quotes/full", params={"scrip-codes": scrip_param})
-            except Exception as err:
-                log.warning("INDMoney quotes fetch error: %s", err)
-                continue
-
-            data = res.get("data", res) if isinstance(res, dict) else {}
+            data = _fetch_chunk(formatted_scrips)
             if not isinstance(data, dict):
                 continue
 
@@ -214,6 +242,11 @@ class INDMoney:
             raise RuntimeError(f"09:15 5-min candle not available for {security_id}")
         b = bars[0]
         return OpeningRange(b.open, b.high, b.low, b.close, b.volume)
+
+    def stream(self, contracts: list[Contract], on_tick: Callable[[str, float, int], None]) -> INDMoneyLiveStream:
+        """Create and return an INDMoney WebSocket streaming client for the given contracts."""
+        instruments = [c.security_id for c in contracts]
+        return INDMoneyLiveStream(self.token, instruments, on_tick)
 
 
 class ICICIDirect:
@@ -347,16 +380,27 @@ class ICICIDirect:
                 continue
         return bars
 
+    def stream(self, contracts: list[Contract], on_tick: Callable[[str, float, int], None]) -> ICICILiveStream:
+        """Create and return an ICICI Direct Breeze WebSocket streaming client for the given contracts."""
+        return ICICILiveStream(self.breeze, contracts, on_tick)
 
-# ------------------------------------------------------- instrument master (public)
+
+# ------------------------------------------------------- live WebSocket streaming
 class INDMoneyLiveStream:
     """WebSocket client helper for INDMoney live price streaming.
     Connects to wss://ws-prices.indstocks.com/api/v1/ws/prices with Authorization header.
     """
 
-    def __init__(self, token: str):
+    def __init__(self, token: str, instruments: list[str] | None = None,
+                 on_tick: Callable[[str, float, int], None] | None = None):
         self.token = token
+        self.instruments = instruments or []
+        self.on_tick = on_tick
         self.ws_url = INDMONEY_WS_URL
+        self.ws = None
+        self.thread: threading.Thread | None = None
+        self.running = False
+        self.connected = False
 
     def build_subscription(self, instruments: list[str], mode: str = "ltp") -> dict:
         """Create subscription payload for WebSocket stream.
@@ -377,22 +421,231 @@ class INDMoneyLiveStream:
             "instruments": formatted,
         }
 
+    def _parse_message(self, message: str | bytes) -> list[tuple[str, float, int]]:
+        """Parse raw incoming WebSocket message into list of (security_id, price, timestamp)."""
+        if isinstance(message, bytes):
+            message = message.decode("utf-8", errors="ignore")
+        try:
+            data = json.loads(message)
+        except Exception:
+            return []
+
+        results = []
+        now_ts = int(time.time())
+
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sub_data = item.get("data")
+            if isinstance(sub_data, dict):
+                items_to_check = [sub_data]
+            elif isinstance(sub_data, list):
+                items_to_check = sub_data
+            else:
+                items_to_check = [item]
+
+            for d in items_to_check:
+                if not isinstance(d, dict):
+                    continue
+                inst = d.get("instrument") or d.get("scrip_code") or d.get("security_id") or d.get("symbol") or ""
+                price_val = d.get("ltp") or d.get("last_price") or d.get("price") or d.get("close")
+                if inst and price_val is not None:
+                    try:
+                        p = float(price_val)
+                        t = int(d.get("timestamp") or d.get("time") or d.get("ts") or now_ts)
+                        if t > 10_000_000_000:
+                            t = t // 1000
+                        results.append((str(inst), p, t))
+                    except (ValueError, TypeError):
+                        continue
+        return results
+
+    def _on_open(self, ws):
+        self.connected = True
+        log.info("[INDMoney WS] WebSocket connected.")
+        if self.instruments:
+            payload = self.build_subscription(self.instruments)
+            ws.send(json.dumps(payload))
+            log.info("[INDMoney WS] Subscribed to %d instruments.", len(self.instruments))
+
+    def _on_message(self, ws, message):
+        parsed = self._parse_message(message)
+        if self.on_tick:
+            for sec_id, price, ts in parsed:
+                try:
+                    self.on_tick(sec_id, price, ts)
+                except Exception as e:
+                    log.error("[INDMoney WS] Error in on_tick callback: %s", e)
+
+    def _on_error(self, ws, error):
+        log.warning("[INDMoney WS] Error: %s", error)
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.connected = False
+        log.info("[INDMoney WS] Connection closed (code: %s, msg: %s)", close_status_code, close_msg)
+
+    def start(self):
+        """Start WebSocket listener in a background daemon thread."""
+        try:
+            import websocket
+        except ImportError:
+            raise RuntimeError("websocket-client is not installed. Run `pip install websocket-client`.")
+
+        self.running = True
+
+        def worker():
+            while self.running:
+                try:
+                    headers = {"Authorization": self.token}
+                    self.ws = websocket.WebSocketApp(
+                        self.ws_url,
+                        header=headers,
+                        on_open=self._on_open,
+                        on_message=self._on_message,
+                        on_error=self._on_error,
+                        on_close=self._on_close,
+                    )
+                    self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                except Exception as e:
+                    log.warning("[INDMoney WS] run_forever error: %s", e)
+                if self.running:
+                    time.sleep(3)
+
+        self.thread = threading.Thread(target=worker, daemon=True, name="indmoney-ws")
+        self.thread.start()
+
+    def stop(self):
+        """Stop WebSocket connection cleanly."""
+        self.running = False
+        self.connected = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+
+class ICICILiveStream:
+    """WebSocket client helper for ICICI Direct Breeze live streaming."""
+
+    def __init__(self, breeze, contracts: list[Contract],
+                 on_tick: Callable[[str, float, int], None] | None = None):
+        self.breeze = breeze
+        self.contracts = contracts
+        self.on_tick = on_tick
+        self.running = False
+        self.connected = False
+        self._token_map: dict[str, str] = {}
+        for c in contracts:
+            parts = c.security_id.split(":")
+            if len(parts) >= 5:
+                tok = parts[0]
+                self._token_map[tok] = c.security_id
+                self._token_map[f"4.1!{tok}"] = c.security_id
+            self._token_map[c.security_id] = c.security_id
+
+    def _on_ticks_handler(self, data):
+        if not data or not isinstance(data, dict):
+            return
+        price_val = data.get("last") or data.get("close") or data.get("ltp") or data.get("ClosePrice")
+        if price_val is None:
+            return
+        try:
+            price = float(price_val)
+        except (ValueError, TypeError):
+            return
+
+        now_ts = int(time.time())
+        sym = str(data.get("symbol") or data.get("stock_name") or data.get("stock_code") or "")
+        sec_id = self._token_map.get(sym) or sym
+        if not sec_id and self.contracts:
+            sec_id = self.contracts[0].security_id
+
+        if self.on_tick:
+            try:
+                self.on_tick(sec_id, price, now_ts)
+            except Exception as e:
+                log.error("[ICICI WS] Error in on_tick callback: %s", e)
+
+    def start(self):
+        """Start Breeze WebSocket connection and subscribe to feeds."""
+        self.running = True
+        self.breeze.on_ticks = self._on_ticks_handler
+        try:
+            self.breeze.ws_connect()
+            self.connected = True
+            log.info("[ICICI WS] Breeze WebSocket connected.")
+        except Exception as e:
+            log.warning("[ICICI WS] ws_connect error: %s", e)
+
+        for c in self.contracts:
+            parts = c.security_id.split(":")
+            if len(parts) >= 5:
+                token, stock_code, expiry_str, strike_str, opt_type = parts[:5]
+                try:
+                    self.breeze.subscribe_feeds(
+                        exchange_code="NFO",
+                        stock_code=stock_code,
+                        product_type="options",
+                        expiry_date=expiry_str,
+                        strike_price=str(strike_str),
+                        right="call" if opt_type.upper() == "CE" else "put",
+                        get_exchange_quotes=True,
+                    )
+                    log.info("[ICICI WS] Subscribed to %s", c.security_id)
+                except Exception as e:
+                    log.warning("[ICICI WS] Failed subscribing %s: %s", c.security_id, e)
+            else:
+                try:
+                    self.breeze.subscribe_feeds(stock_token=c.security_id, get_exchange_quotes=True)
+                except Exception as e:
+                    log.warning("[ICICI WS] Failed subscribing stock_token %s: %s", c.security_id, e)
+
+    def stop(self):
+        """Disconnect Breeze WebSocket."""
+        self.running = False
+        self.connected = False
+        try:
+            self.breeze.ws_disconnect()
+        except Exception:
+            pass
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+
+def get_stream(broker_inst, contracts: list[Contract], on_tick: Callable[[str, float, int], None]):
+    """Unified entry point to create a streaming client from any supported broker."""
+    if hasattr(broker_inst, "stream"):
+        return broker_inst.stream(contracts, on_tick)
+    raise NotImplementedError(f"Broker {broker_inst} does not support live streaming")
+
 
 def load_indmoney_equity_map(cfg: Settings | None = None) -> dict[str, str]:
     """Return map of NSE EQ symbol -> equity security_id (e.g. 'RELIANCE' -> '2885')."""
     cache = ROOT / "data" / f"indmoney_equity_{datetime.now(IST):%Y-%m-%d}.csv"
     if not cache.exists():
         cache.parent.mkdir(exist_ok=True)
-        resp = requests.Session()
-        resp.trust_env = False
-        token = auth.get_access_token(cfg) if cfg else ""
-        headers = {"Authorization": token} if token else {}
         try:
+            token = auth.get_access_token(cfg) if cfg else ""
+            headers = {"Authorization": token} if token else {}
+            resp = requests.Session()
+            resp.trust_env = False
             res = resp.get(f"{INDMONEY_BASE_URL}/market/instruments?source=equity", headers=headers, timeout=60)
             if res.ok and len(res.content) > 50:
                 cache.write_text(res.content.decode("utf-8-sig", errors="ignore"), encoding="utf-8")
         except Exception as e:
             log.warning("Could not download INDMoney equity instruments: %s", e)
+    if not cache.exists():
+        existing = sorted((ROOT / "data").glob("indmoney_equity_*.csv"))
+        if existing:
+            cache = existing[-1]
     if cache.exists():
         with cache.open(encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
@@ -409,17 +662,21 @@ def load_indmoney_master(cfg: Settings | None = None) -> list[dict[str, str]]:
     cache = ROOT / "data" / f"indmoney_instruments_{datetime.now(IST):%Y-%m-%d}.csv"
     if not cache.exists():
         cache.parent.mkdir(exist_ok=True)
-        resp = requests.Session()
-        resp.trust_env = False
-        token = auth.get_access_token(cfg) if cfg else ""
-        headers = {"Authorization": token} if token else {}
         try:
+            token = auth.get_access_token(cfg) if cfg else ""
+            headers = {"Authorization": token} if token else {}
+            resp = requests.Session()
+            resp.trust_env = False
             res = resp.get(f"{INDMONEY_BASE_URL}/market/instruments?source=fno", headers=headers, timeout=60)
             if res.ok and len(res.content) > 50:
                 text = res.content.decode("utf-8-sig", errors="ignore")
                 cache.write_text(text, encoding="utf-8")
         except Exception as e:
             log.warning("Could not download INDMoney instruments: %s", e)
+    if not cache.exists():
+        existing = sorted((ROOT / "data").glob("indmoney_instruments_*.csv"))
+        if existing:
+            cache = existing[-1]
     if cache.exists():
         with cache.open(encoding="utf-8") as fh:
             return list(csv.DictReader(fh))
@@ -457,12 +714,20 @@ def build_indmoney_universe(master: list[dict[str, str]], cfg: Settings | None =
     for r in master:
         inst = r.get("INSTRUMENT_NAME") or r.get("INSTRUMENT") or r.get("InstrumentName") or ""
         exch = r.get("EXCH") or ""
-        if inst in ("OPTSTK", "FUTSTK", "") and exch in ("NSE", ""):
+        if inst in ("OPTSTK", "FUTSTK") and exch == "NSE":
+            custom = (r.get("CUSTOM_SYMBOL") or "").strip()
             tsym = (r.get("TRADING_SYMBOL") or r.get("UNDERLYING_SYMBOL") or r.get("SYMBOL") or
                    r.get("Symbol") or r.get("ShortName") or "").strip()
-            sym = tsym.split("-")[0].strip() if "-" in tsym else tsym
-            sid = equity_map.get(sym) or r.get("UNDERLYING_SECURITY_ID") or r.get("SECURITY_ID") or ""
+            if custom:
+                sym = custom.split()[0].strip()
+            elif "-" in tsym:
+                sym = tsym.rsplit("-", 3)[0].strip() if inst == "OPTSTK" else tsym.rsplit("-", 2)[0].strip()
+            else:
+                sym = tsym
+
+            sid = equity_map.get(sym) or ""
             lot = (r.get("LOT_UNITS") or r.get("LOT_SIZE") or r.get("LotSize") or r.get("LOT") or "").strip()
+            # Only include if we have a valid cash equity security ID from the equity map
             if sym and sid and sym not in found:
                 found[sym] = {"symbol": sym, "security_id": sid, "lot_size": lot}
     return sorted(found.values(), key=lambda x: x["symbol"])
@@ -505,9 +770,16 @@ def indmoney_option_contracts(master: list[dict[str, str]], underlying_id: str,
         if exch and exch != "NSE":
             continue
 
+        custom = (r.get("CUSTOM_SYMBOL") or "").strip()
         tsym = (r.get("TRADING_SYMBOL") or r.get("UNDERLYING_SYMBOL") or r.get("SYMBOL") or
                 r.get("Symbol") or r.get("ShortName") or "").strip()
-        sym = tsym.split("-")[0].strip() if "-" in tsym else tsym
+        if custom:
+            sym = custom.split()[0].strip()
+        elif "-" in tsym:
+            sym = tsym.rsplit("-", 3)[0].strip()
+        else:
+            sym = tsym
+
         otype = (r.get("OPTION_TYPE") or r.get("OptionType") or r.get("RIGHT") or "").strip().upper()
         if not otype and tsym.endswith("CE"):
             otype = "CE"
@@ -533,7 +805,8 @@ def indmoney_option_contracts(master: list[dict[str, str]], underlying_id: str,
                 sid = r.get("SECURITY_ID") or r.get("SCRIP_CODE") or r.get("Token") or ""
                 strike = float(r.get("STRIKE_PRICE") or r.get("StrikePrice") or 0.0)
                 lot = int(float(r.get("LOT_UNITS") or r.get("LOT_SIZE") or r.get("LotSize") or 1))
-                out.append(Contract(sid, opt_type_upper, exp_date, strike, lot))
+                contract_sec_id = f"NFO_{sid}" if ("_" not in str(sid) and ":" not in str(sid)) else str(sid)
+                out.append(Contract(contract_sec_id, opt_type_upper, exp_date, strike, lot))
             except (KeyError, ValueError):
                 continue
     return out
@@ -565,7 +838,7 @@ def option_contracts(master: list[dict[str, str]], underlying_id: str,
         return icici_option_contracts(master, underlying_id, option_type)
     if master and "Token" in master[0] and "ShortName" in master[0]:
         return icici_option_contracts(master, underlying_id, option_type)
-    return indmoney_option_contracts(master, underlying_id, option_type)
+    return indmoney_option_contracts(master, underlying_id, option_type, cfg=cfg)
 
 
 def get_broker(cfg: Settings) -> INDMoney | ICICIDirect:
