@@ -1,10 +1,29 @@
 """Unit tests for ICICI Direct broker integration and authentication."""
 
+import io
 import tempfile
 import unittest
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
+
+# Mock urlopen for breeze_connect module import offline
+_zbuf = io.BytesIO()
+with zipfile.ZipFile(_zbuf, "w") as _zf:
+    pass
+_zip_bytes = _zbuf.getvalue()
+
+class _FakeResp:
+    def read(self):
+        return _zip_bytes
+
+_p = mock.patch("urllib.request.urlopen", return_value=_FakeResp())
+_p.start()
+try:
+    import breeze_connect
+finally:
+    _p.stop()
 
 import auth
 import broker

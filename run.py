@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
+import logging
 import os
 import threading
 import time
@@ -135,6 +137,8 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
 # ------------------------------------------------------------------------ trade
 def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> list[Position]:
     positions, later, skipped = [], {}, []
+    is_live = (getattr(cfg, "trading_mode", "paper") == "live")
+
     for m in movers:
         contract = picks[m["symbol"]]
         bars = broker.option_candles(contract.security_id, today())
@@ -143,12 +147,72 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
         if pos is None:
             skipped.append((m["symbol"], why))
             continue
+
+        if is_live:
+            pos.mode = "live"
+            # Check available margin for that particular script in F&O wallet
+            has_margin, req_margin, avail_margin = broker.check_margin_available(contract, pos.entry, pos.lots)
+            if not has_margin:
+                msg = f"insufficient F&O margin (required: Rs {req_margin:,.2f}, available: Rs {avail_margin:,.2f})"
+                print(f"[MARGIN NOT AVAILABLE] {m['symbol']} {contract.option_type} {contract.strike}: "
+                      f"Required Margin = Rs {req_margin:,.2f}, Available F&O Margin = Rs {avail_margin:,.2f}. "
+                      f"Trade not taken.")
+                skipped.append((m["symbol"], msg))
+                continue
+
+            print(f"[MARGIN AVAILABLE] {m['symbol']} {contract.option_type} {contract.strike}: "
+                  f"Required Margin = Rs {req_margin:,.2f}, Available F&O Margin = Rs {avail_margin:,.2f}. "
+                  f"Taking live trade...")
+            try:
+                order_res = broker.place_order(m["symbol"], contract, action="BUY", qty=pos.qty,
+                                               price=pos.entry, order_type="MARKET")
+                order_id = str(order_res.get("order_id") or "")
+                pos.order_id = order_id
+                print(f"[LIVE ORDER PLACED] {pos.symbol} BUY {pos.qty} {contract.option_type} {contract.strike} (Order ID: {order_id})")
+
+                # After taking trade, check trade list from broker so code can observe from it
+                time.sleep(1)
+                try:
+                    trades = broker.get_trade_list(today())
+                    matched_trade = None
+                    for t in trades:
+                        t_oid = str(t.get("order_id") or "")
+                        t_sec = str(t.get("security_id") or "")
+                        t_sym = str(t.get("symbol") or "")
+                        if order_id and t_oid == order_id:
+                            matched_trade = t
+                            break
+                        if t.get("action", "").upper() == "BUY" and (m["symbol"] in t_sym or t_sec in contract.security_id):
+                            matched_trade = t
+                            break
+
+                    if matched_trade:
+                        exec_px = float(matched_trade.get("price") or 0.0)
+                        if exec_px > 0:
+                            pos.entry = exec_px
+                            pos.executed_entry = exec_px
+                            pos.risk = abs(pos.entry - pos.initial_stop)
+                            print(f"[LIVE TRADE CONFIRMED] Broker trade list verified: {pos.symbol} filled at Rs {exec_px:.2f} "
+                                  f"(Trade ID: {matched_trade.get('trade_id', order_id)}, Qty: {pos.qty})")
+                    else:
+                        print(f"[LIVE TRADE OBSERVED] Watching live position {pos.symbol} from broker with entry Rs {pos.entry:.2f}")
+                except Exception as t_err:
+                    print(f"[LIVE TRADE LIST] Could not verify broker trade list for {pos.symbol}: {t_err}")
+            except Exception as e:
+                err_msg = f"Order placement failed: {e}"
+                print(f"[LIVE ORDER ERROR] {m['symbol']}: {err_msg}")
+                skipped.append((m["symbol"], err_msg))
+                continue
+        else:
+            pos.mode = "paper"
+
         positions.append(pos)
         later[pos.symbol] = rest
+
     note = run_session(positions, later, cfg.max_daily_loss, cfg.force_exit)
     write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in positions])
     write_csv(DATA / today() / "skipped.csv", [{"symbol": s, "reason": w} for s, w in skipped])
-    print_report(positions, skipped, note)
+    print_report(positions, skipped, note, mode=cfg.trading_mode)
     return positions
 
 
@@ -161,15 +225,19 @@ def trade_row(p: Position) -> dict:
             "entry": round(p.entry, 2), "initial_stop": round(p.initial_stop, 2),
             "stop_now": round(p.stop, 2), "exit_time": fmt_time(p.exit_ts),
             "exit_or_last": round(p.price_now, 2), "pnl": round(p.pnl, 2),
-            "r_multiple": round(p.r_multiple, 2), "trailing": p.trailing, "status": p.status}
+            "r_multiple": round(p.r_multiple, 2), "trailing": p.trailing, "status": p.status,
+            "mode": getattr(p, "mode", "paper"),
+            "order_id": getattr(p, "order_id", ""),
+            "exit_order_id": getattr(p, "exit_order_id", "")}
 
 
-def print_report(positions: list[Position], skipped: list, note: str) -> None:
+def print_report(positions: list[Position], skipped: list, note: str, mode: str = "paper") -> None:
     print(f"\n{'SYMBOL':<12}{'DIR':<5}{'STRIKE':>9}{'LOTS':>5}{'ENTRY':>9}{'STOP':>9}"
-          f"{'NOW/EXIT':>10}{'P&L':>10}{'R':>7}  STATUS")
+          f"{'NOW/EXIT':>10}{'P&L':>10}{'R':>7}  {'MODE':<6} STATUS")
     for p in positions:
+        pmode = getattr(p, "mode", mode).upper()
         print(f"{p.symbol:<12}{p.direction:<5}{p.contract.strike:>9.1f}{p.lots:>5}{p.entry:>9.2f}"
-              f"{p.stop:>9.2f}{p.price_now:>10.2f}{p.pnl:>10.0f}{p.r_multiple:>7.2f}  {p.status}")
+              f"{p.stop:>9.2f}{p.price_now:>10.2f}{p.pnl:>10.0f}{p.r_multiple:>7.2f}  {pmode:<6} {p.status}")
     total = sum(p.pnl for p in positions)
     wins = sum(p.pnl > 0 for p in positions)
     print(f"\nTrades: {len(positions)}   Wins: {wins}   Net P&L: Rs {total:,.0f}"
@@ -178,7 +246,10 @@ def print_report(positions: list[Position], skipped: list, note: str) -> None:
         print(f"  skipped {symbol}: {why}")
     if note:
         print(f"  note: {note}")
-    print("PAPER ONLY - no order was sent.")
+    if mode == "live" or any(getattr(p, "mode", "") == "live" for p in positions):
+        print("LIVE TRADING - Real broker orders were submitted.")
+    else:
+        print("PAPER ONLY - no order was sent.")
 
 
 def load_movers() -> list[dict]:
@@ -246,14 +317,44 @@ class LiveTradeSession:
                 # Instant tick-level stop-loss check
                 closed = pos.on_tick(price, ts)
                 if closed:
-                    print(f"\n[WS STOP] {pos.symbol} stop loss hit at {price:.2f} (Stop: {pos.stop:.2f})")
+                    if getattr(pos, "mode", "paper") == "live":
+                        try:
+                            exit_res = self.broker.place_order(pos.symbol, pos.contract, action="SELL",
+                                                               qty=pos.qty, price=price, order_type="MARKET")
+                            pos.exit_order_id = str(exit_res.get("order_id", ""))
+                            time.sleep(0.5)
+                            exit_trades = self.broker.get_trade_list(today())
+                            matched_exit = next((t for t in exit_trades if str(t.get("order_id")) == pos.exit_order_id or
+                                                (t.get("action") == "SELL" and pos.symbol in str(t.get("symbol", "")))), None)
+                            if matched_exit and float(matched_exit.get("price") or 0) > 0:
+                                pos.exit_price = float(matched_exit["price"])
+                                pos.executed_exit = pos.exit_price
+                            print(f"\n[LIVE STOP HIT] {pos.symbol} stop loss hit at Rs {price:.2f} -> Closed on broker "
+                                  f"(Order ID: {pos.exit_order_id}, Exit: Rs {pos.exit_price:.2f})")
+                        except Exception as e:
+                            print(f"\n[LIVE STOP ERROR] Failed to close {pos.symbol} on broker: {e}")
+                    else:
+                        print(f"\n[WS STOP] {pos.symbol} stop loss hit at {price:.2f} (Stop: {pos.stop:.2f})")
                     self._persist()
 
             # Aggregate tick into 5-minute candle
             completed_bar = self.aggregator.add_tick(sym, price, ts)
             if completed_bar:
                 if pos and pos.status == "OPEN":
+                    prev_stop = pos.stop
                     pos.on_bar(completed_bar)
+                    if pos.status != "OPEN":
+                        if getattr(pos, "mode", "paper") == "live" and not pos.exit_order_id:
+                            try:
+                                exit_res = self.broker.place_order(pos.symbol, pos.contract, action="SELL",
+                                                                   qty=pos.qty, price=pos.stop, order_type="MARKET")
+                                pos.exit_order_id = str(exit_res.get("order_id", ""))
+                                print(f"\n[LIVE BAR STOP] {pos.symbol} stopped out at Rs {pos.stop:.2f} -> Closed on broker "
+                                      f"(Order ID: {pos.exit_order_id})")
+                            except Exception as e:
+                                print(f"\n[LIVE STOP ERROR] Failed to close {pos.symbol} on broker: {e}")
+                    elif pos.status == "OPEN" and pos.trailing and pos.stop != prev_stop:
+                        print(f"\n[TRAILING SL] {pos.symbol} trailing stop ratcheted to Rs {pos.stop:.2f}")
                     self._persist()
 
             # Shared daily loss limit check
@@ -261,6 +362,14 @@ class LiveTradeSession:
                 for p in self.positions:
                     if p.status == "OPEN":
                         p.close(p.last_price, ts, "EXIT_DAILY_LOSS")
+                        if getattr(p, "mode", "paper") == "live" and not p.exit_order_id:
+                            try:
+                                res = self.broker.place_order(p.symbol, p.contract, action="SELL", qty=p.qty,
+                                                              price=p.last_price, order_type="MARKET")
+                                p.exit_order_id = str(res.get("order_id", ""))
+                                print(f"\n[DAILY LOSS EXIT] {p.symbol} closed on broker (Order ID: {p.exit_order_id})")
+                            except Exception as e:
+                                print(f"\n[DAILY LOSS EXIT ERROR] Failed to close {p.symbol}: {e}")
                 self._persist()
 
             # Periodically write trades.csv so dashboard reflects live tick P&L
@@ -299,8 +408,16 @@ class LiveTradeSession:
             for p in self.positions:
                 if p.status == "OPEN":
                     p.close(p.last_price, now_ts, "EXIT_FORCED")
+                    if getattr(p, "mode", "paper") == "live" and not p.exit_order_id:
+                        try:
+                            res = self.broker.place_order(p.symbol, p.contract, action="SELL", qty=p.qty,
+                                                          price=p.last_price, order_type="MARKET")
+                            p.exit_order_id = str(res.get("order_id", ""))
+                            print(f"\n[FORCE EXIT] {p.symbol} closed on broker at 15:00 (Order ID: {p.exit_order_id})")
+                        except Exception as e:
+                            print(f"\n[FORCE EXIT ERROR] Failed to close {p.symbol}: {e}")
             self._persist()
-            print_report(self.positions, self.skipped, "force-exit time reached")
+            print_report(self.positions, self.skipped, "force-exit time reached", mode=self.cfg.trading_mode)
         return self.positions
 
     def _fallback_polling(self) -> list[Position]:
@@ -317,6 +434,21 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
         raise SystemExit("No movers for today - run `python run.py scan` first.")
 
     master, broker = load_master(cfg), get_broker(cfg)
+    broker_name = "ICICI Direct" if cfg.active_broker in ("icici", "icicidirect") else "INDMoney"
+    mode_str = cfg.trading_mode.upper()
+    print(f"\n{'=' * 65}")
+    print(f" Trading Mode : [{mode_str}] | Active Broker: {broker_name}")
+    if cfg.trading_mode == "live":
+        try:
+            fno_avail = broker.get_fno_margin()
+            print(f" F&O Margin   : Rs {fno_avail:,.2f} available in wallet")
+        except Exception as e:
+            print(f" F&O Margin   : Could not fetch wallet margin ({e})")
+        print(" WARNING      : LIVE MODE ACTIVE. Real orders will be submitted to broker!")
+    else:
+        print(" Simulation   : Paper mode active. Virtual orders only (no capital risk).")
+    print(f"{'=' * 65}\n")
+
     picks = {}
     for m in movers:     # choose each ATM contract once, using the 5-min close as spot
         kind = "CE" if m["direction"] == "CALL" else "PE"
@@ -398,11 +530,14 @@ def cmd_login(cfg: Settings, pin: str | None = None, totp: str | None = None, fo
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="F&O opening-range momentum - paper trading MVP")
+    parser = argparse.ArgumentParser(description="F&O opening-range momentum - trading bot")
     parser.add_argument("--login", action="store_true", help="authenticate with INDMoney / active broker (MPIN + TOTP) and cache fresh access token")
     parser.add_argument("--force", action="store_true", help="force requesting a new token from broker even if cached/existing is valid")
     parser.add_argument("--pin", type=str, default=None, help="INDMoney MPIN (optional, overrides .env)")
     parser.add_argument("--totp", type=str, default=None, help="6-digit TOTP code or secret (optional, overrides .env)")
+    parser.add_argument("--mode", type=str, choices=["paper", "live"], default=None, help="trading mode ('paper' or 'live')")
+    parser.add_argument("--live", action="store_true", help="run in live trading mode with real broker orders")
+    parser.add_argument("--paper", action="store_true", help="run in paper trading mode (simulation)")
 
     sub = parser.add_subparsers(dest="cmd", required=False)
     login_cmd = sub.add_parser("login", help="authenticate with INDMoney / active broker (MPIN + TOTP) and cache fresh access token")
@@ -415,13 +550,29 @@ def main() -> None:
     scan.add_argument("--history", action="store_true", help="force historical candles")
     trade = sub.add_parser("trade")
     trade.add_argument("--watch", action="store_true", help="refresh every minute")
-    sub.add_parser("daemon", help="run once; handles every trading day automatically")
+    trade.add_argument("--mode", type=str, choices=["paper", "live"], default=None, help="trading mode ('paper' or 'live')")
+    trade.add_argument("--live", action="store_true", help="run in live trading mode with real broker orders")
+    trade.add_argument("--paper", action="store_true", help="run in paper trading mode (simulation)")
+
+    daemon_cmd = sub.add_parser("daemon", help="run once; handles every trading day automatically")
+    daemon_cmd.add_argument("--mode", type=str, choices=["paper", "live"], default=None, help="trading mode ('paper' or 'live')")
+    daemon_cmd.add_argument("--live", action="store_true", help="run in live trading mode with real broker orders")
+    daemon_cmd.add_argument("--paper", action="store_true", help="run in paper trading mode (simulation)")
+
     dash = sub.add_parser("dashboard", help="open the trade dashboard in your browser")
     dash.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
 
+    cfg = load_settings()
+    mode_arg = getattr(args, "mode", None)
+    if getattr(args, "live", False) or mode_arg == "live":
+        cfg = dataclasses.replace(cfg, trading_mode="live")
+        os.environ["TRADING_MODE"] = "live"
+    elif getattr(args, "paper", False) or mode_arg == "paper":
+        cfg = dataclasses.replace(cfg, trading_mode="paper")
+        os.environ["TRADING_MODE"] = "paper"
+
     if getattr(args, "login", False) or args.cmd == "login":
-        cfg = load_settings()
         pin = getattr(args, "pin", None)
         totp = getattr(args, "totp", None)
         force = getattr(args, "force", False)
@@ -442,7 +593,6 @@ def main() -> None:
         dashboard.serve(port=args.port or load_settings().dashboard_port)
         return
 
-    cfg = load_settings()
     if args.cmd == "universe":
         cmd_universe(cfg)
     elif args.cmd == "scan":

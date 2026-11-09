@@ -176,7 +176,7 @@ def process_day(day: date) -> None:
         log.info("%s: no qualifying movers today - nothing to trade", day)
         return
 
-    log.info("%s: paper trading (refreshes every minute until %s)", day, cfg.force_exit)
+    log.info("%s: %s trading (refreshes every minute until %s)", day, cfg.trading_mode, cfg.force_exit)
     ok, positions = attempt("trade", lambda c: run.cmd_trade(c, watch=True), cfg.force_exit)
     if ok:
         write_summary(day, positions)

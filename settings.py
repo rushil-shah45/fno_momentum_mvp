@@ -27,6 +27,7 @@ def _read_env_file(path: Path) -> dict[str, str]:
 @dataclass(frozen=True)
 class Settings:
     active_broker: str = "indmoney"     # 'indmoney' or 'icici'
+    trading_mode: str = "paper"         # 'paper' (default) or 'live'
 
     # INDMoney settings
     indmoney_client_id: str = ""        # x-api-key header (Client ID from INDstocks TOTP setup)
@@ -62,8 +63,11 @@ def load_settings() -> Settings:
     env = {**_read_env_file(ROOT / ".env"), **os.environ}
     hh, mm = env.get("FORCE_EXIT", "15:00").split(":")
     active_broker = env.get("ACTIVE_BROKER", env.get("BROKER", "indmoney")).strip().lower()
+    raw_mode = env.get("TRADING_MODE", env.get("MODE", "paper")).strip().lower()
+    trading_mode = "live" if raw_mode in ("live", "real") else "paper"
     return Settings(
         active_broker=active_broker,
+        trading_mode=trading_mode,
         indmoney_client_id=env.get("INDMONEY_CLIENT_ID", ""),
         indmoney_mpin=env.get("INDMONEY_MPIN", env.get("INDMONEY_PIN", "")),
         indmoney_totp_secret=env.get("INDMONEY_TOTP_SECRET", ""),

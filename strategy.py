@@ -120,6 +120,11 @@ class Position:
     last_price: float = 0.0
     exit_price: float | None = None
     exit_ts: int | None = None
+    mode: str = "paper"          # "paper" or "live"
+    order_id: str = ""           # Live broker buy order ID
+    exit_order_id: str = ""      # Live broker sell order ID
+    executed_entry: float | None = None
+    executed_exit: float | None = None
 
     @property
     def qty(self) -> int:

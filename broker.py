@@ -1,4 +1,4 @@
-"""Read-only market-data client for INDMoney and ICICI Direct. There is deliberately NO order code here."""
+"""Market-data and order execution client for INDMoney and ICICI Direct (supporting Paper and Live trading)."""
 
 from __future__ import annotations
 
@@ -75,6 +75,38 @@ class INDMoney:
                         raise requests.HTTPError(f"{ex} - Response: {err_text}", response=resp) from ex
                     raise
             return resp.json()
+        raise RuntimeError("INDMoney rate limit: too many retries")
+
+    def _post(self, path: str, payload: dict | None = None) -> dict:
+        renewed = False
+        for attempt in range(3):
+            resp = self.http.post(f"{INDMONEY_BASE_URL}{path}", json=payload, timeout=30)
+            if resp.status_code == 401:
+                if auth.indmoney_auto_enabled(self.cfg) and not renewed:
+                    renewed = True
+                    self.token = auth.get_access_token(self.cfg, force=True)
+                    self.http.headers["Authorization"] = self.token
+                    continue
+            if resp.status_code == 429:
+                time.sleep(2 * (attempt + 1))
+                continue
+            is_ok = getattr(resp, "ok", resp.status_code < 400)
+            if not is_ok:
+                err_text = ""
+                try:
+                    err_text = resp.text
+                except Exception:
+                    pass
+                try:
+                    resp.raise_for_status()
+                except requests.HTTPError as ex:
+                    if err_text:
+                        raise requests.HTTPError(f"{ex} - Response: {err_text}", response=resp) from ex
+                    raise
+            try:
+                return resp.json()
+            except ValueError:
+                return {"status": "ok", "text": resp.text}
         raise RuntimeError("INDMoney rate limit: too many retries")
 
     # ----------------------------------------------------------------- quotes
@@ -248,6 +280,157 @@ class INDMoney:
         instruments = [c.security_id for c in contracts]
         return INDMoneyLiveStream(self.token, instruments, on_tick)
 
+    # ------------------------------------------------ funds, margins & orders
+    def get_funds(self) -> dict:
+        """Fetch available funds and margin breakdown from INDMoney."""
+        data = None
+        for path in ("/funds/limits", "/funds", "/user/funds"):
+            try:
+                res = self._get(path)
+                if res:
+                    data = res
+                    break
+            except Exception as err:
+                log.debug("INDMoney %s fetch failed: %s", path, err)
+                continue
+
+        if not data:
+            return {"available_margin": 0.0, "fno_margin": 0.0, "raw": {}}
+
+        items = data.get("result") or data.get("data") or data
+        target = items[0] if isinstance(items, list) and items else (items if isinstance(items, dict) else {})
+
+        def _to_float(v) -> float:
+            try:
+                return float(v or 0.0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        avail = _to_float(target.get("availableMargin") or target.get("available_margin") or
+                          target.get("netMarginAvailable") or target.get("openingBalance") or 0.0)
+        fno_val = _to_float(target.get("fnoNrml") or target.get("fnoDay") or target.get("fno_margin") or
+                            target.get("derivativeMargin") or avail)
+
+        return {
+            "available_margin": avail,
+            "fno_margin": fno_val if fno_val > 0 else avail,
+            "raw": data,
+        }
+
+    def get_fno_margin(self) -> float:
+        """Return available F&O trading margin in wallet."""
+        f = self.get_funds()
+        return float(f.get("fno_margin") or f.get("available_margin") or 0.0)
+
+    def check_margin_available(self, contract: Contract, price: float, lots: int = 1) -> tuple[bool, float, float]:
+        """Check if sufficient F&O wallet margin is available for the option buy order.
+        Returns (is_available, required_margin, available_margin).
+        """
+        required = round(float(price) * int(contract.lot_size) * int(lots), 2)
+        available = float(self.get_fno_margin())
+        return (available >= required, required, available)
+
+    def place_order(self, symbol: str, contract: Contract, action: str, qty: int,
+                    price: float = 0.0, order_type: str = "MARKET") -> dict:
+        """Place live order with INDMoney."""
+        raw_sec = contract.security_id.replace("NFO_", "").replace("NSE_", "")
+        if ":" in raw_sec:
+            raw_sec = raw_sec.split(":")[0]
+
+        payload = {
+            "txn_type": action.upper(),
+            "exchange": "NSE",
+            "segment": "DERIVATIVE",
+            "product": "MARGIN",
+            "order_type": order_type.upper(),
+            "validity": "DAY",
+            "security_id": str(raw_sec),
+            "qty": int(qty),
+        }
+        if order_type.upper() == "LIMIT" and price > 0:
+            payload["limit_price"] = round(float(price), 2)
+
+        log.info("[INDMoney] Placing %s order for %s (%s): %s", action, symbol, contract.security_id, payload)
+        res = self._post("/order", payload=payload)
+        order_id = ""
+        if isinstance(res, dict):
+            order_id = (res.get("order_id") or res.get("orderId") or res.get("order_no") or
+                        (res.get("data") if isinstance(res.get("data"), dict) else {}).get("order_id") or
+                        (res.get("result") if isinstance(res.get("result"), dict) else {}).get("order_id") or "")
+        return {
+            "order_id": str(order_id),
+            "status": "PLACED" if order_id else res.get("status", "SUBMITTED"),
+            "raw": res,
+        }
+
+    def get_trade_list(self, day: str | None = None) -> list[dict]:
+        """Fetch list of executed trades from INDMoney."""
+        trades_raw = None
+        for path in ("/trade-book", "/trades", "/order-book"):
+            try:
+                res = self._get(path)
+                if res:
+                    trades_raw = res
+                    break
+            except Exception:
+                continue
+
+        if not trades_raw:
+            return []
+
+        items = trades_raw.get("result") or trades_raw.get("data") or trades_raw
+        if isinstance(items, dict):
+            items = items.get("trades") or items.get("orders") or [items]
+        if not isinstance(items, list):
+            return []
+
+        out = []
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            oid = str(t.get("order_id") or t.get("orderId") or t.get("order_no") or "")
+            tid = str(t.get("trade_id") or t.get("tradeId") or t.get("trade_no") or oid)
+            sec = str(t.get("security_id") or t.get("scrip_code") or "")
+            sym = str(t.get("symbol") or t.get("trading_symbol") or "")
+            px = float(t.get("trade_price") or t.get("price") or t.get("avg_price") or t.get("average_price") or 0.0)
+            qty = int(float(t.get("trade_qty") or t.get("traded_qty") or t.get("qty") or t.get("quantity") or 0))
+            act = str(t.get("txn_type") or t.get("action") or t.get("type") or "").upper()
+            tm = str(t.get("trade_time") or t.get("timestamp") or t.get("order_time") or "")
+            status = str(t.get("status") or "EXECUTED").upper()
+            out.append({
+                "order_id": oid,
+                "trade_id": tid,
+                "security_id": sec,
+                "symbol": sym,
+                "price": px,
+                "qty": qty,
+                "action": act,
+                "time": tm,
+                "status": status,
+                "raw": t,
+            })
+        return out
+
+    def get_order_list(self, day: str | None = None) -> list[dict]:
+        """Fetch today's orders from INDMoney."""
+        try:
+            res = self._get("/order-book")
+            items = res.get("result") or res.get("data") or res
+            return items if isinstance(items, list) else []
+        except Exception as e:
+            log.warning("INDMoney get_order_list error: %s", e)
+            return []
+
+    def get_positions(self) -> list[dict]:
+        """Fetch open derivative positions from INDMoney."""
+        try:
+            res = self._get("/portfolio/positions", params={"segment": "derivative", "product": "margin"})
+            items = res.get("result") or res.get("data") or res
+            return items if isinstance(items, list) else []
+        except Exception as e:
+            log.warning("INDMoney get_positions error: %s", e)
+            return []
+
 
 class ICICIDirect:
     """Read-only ICICI Direct Breeze API market-data client."""
@@ -383,6 +566,199 @@ class ICICIDirect:
     def stream(self, contracts: list[Contract], on_tick: Callable[[str, float, int], None]) -> ICICILiveStream:
         """Create and return an ICICI Direct Breeze WebSocket streaming client for the given contracts."""
         return ICICILiveStream(self.breeze, contracts, on_tick)
+
+    # ------------------------------------------------ funds, margins & orders
+    def get_funds(self) -> dict:
+        """Fetch account funds and F&O margin from ICICI Breeze."""
+        funds_res = {}
+        try:
+            funds_res = self.breeze.get_funds() or {}
+        except Exception as err:
+            log.warning("ICICI get_funds error: %s", err)
+
+        margin_res = {}
+        try:
+            margin_res = self.breeze.get_margin(exchange_code="NFO") or {}
+        except Exception as err:
+            log.debug("ICICI get_margin(NFO) error: %s", err)
+
+        def _to_float(v) -> float:
+            try:
+                return float(v or 0.0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        f_data = funds_res.get("Success") or {}
+        if isinstance(f_data, list) and f_data:
+            f_data = f_data[0]
+        m_data = margin_res.get("Success") or {}
+        if isinstance(m_data, list) and m_data:
+            m_data = m_data[0]
+
+        allocated_fno = _to_float(f_data.get("allocated_fno"))
+        bank_bal = _to_float(f_data.get("total_bank_balance"))
+        cash_limit = _to_float(m_data.get("cash_limit") or m_data.get("amount_allocated"))
+        blocked = _to_float(m_data.get("block_by_trade") or f_data.get("block_by_trade_equity"))
+
+        available_margin = max(0.0, (cash_limit if cash_limit > 0 else allocated_fno) - blocked)
+        if available_margin == 0.0 and bank_bal > 0:
+            available_margin = bank_bal
+
+        fno_margin = allocated_fno if allocated_fno > 0 else available_margin
+
+        return {
+            "available_margin": available_margin,
+            "fno_margin": fno_margin,
+            "raw": {"funds": funds_res, "margin": margin_res},
+        }
+
+    def get_fno_margin(self) -> float:
+        """Return available F&O trading margin in wallet."""
+        f = self.get_funds()
+        return float(f.get("fno_margin") or f.get("available_margin") or 0.0)
+
+    def check_margin_available(self, contract: Contract, price: float, lots: int = 1) -> tuple[bool, float, float]:
+        """Check if sufficient F&O wallet margin is available for the option buy order.
+        Returns (is_available, required_margin, available_margin).
+        """
+        required = round(float(price) * int(contract.lot_size) * int(lots), 2)
+        available = float(self.get_fno_margin())
+        return (available >= required, required, available)
+
+    def place_order(self, symbol: str, contract: Contract, action: str, qty: int,
+                    price: float = 0.0, order_type: str = "MARKET") -> dict:
+        """Place live options order with ICICI Direct Breeze."""
+        parts = contract.security_id.split(":")
+        if len(parts) >= 5:
+            _, stock_code, expiry_str, strike_str, opt_type = parts[:5]
+        else:
+            stock_code = symbol
+            expiry_str = contract.expiry.strftime("%d-%b-%Y")
+            strike_str = str(contract.strike)
+            opt_type = contract.option_type
+
+        try:
+            exp_date = datetime.strptime(expiry_str.strip(), "%d-%b-%Y").strftime("%Y-%m-%dT06:00:00.000Z")
+        except ValueError:
+            exp_date = f"{expiry_str.strip()}T06:00:00.000Z" if "T" not in expiry_str else expiry_str.strip()
+
+        log.info("[ICICI Breeze] Placing %s order for %s (%s, strike=%s, right=%s, qty=%s, price=%s)",
+                 action, stock_code, exp_date, strike_str, opt_type, qty, price)
+
+        res = self.breeze.place_order(
+            stock_code=stock_code,
+            exchange_code="NFO",
+            product="options",
+            action=action.lower(),
+            order_type=order_type.lower(),
+            quantity=str(qty),
+            price=str(round(price, 2)) if price > 0 else "0",
+            validity="day",
+            expiry_date=exp_date,
+            right="call" if opt_type.upper() == "CE" else "put",
+            strike_price=str(strike_str),
+        )
+
+        order_id = ""
+        if isinstance(res, dict):
+            success = res.get("Success")
+            if isinstance(success, dict):
+                order_id = success.get("order_id") or success.get("order_reference") or ""
+            elif isinstance(success, str):
+                order_id = success
+        return {
+            "order_id": str(order_id),
+            "status": "PLACED" if order_id else (res.get("Error") or "FAILED"),
+            "raw": res,
+        }
+
+    def get_trade_list(self, day: str | None = None) -> list[dict]:
+        """Fetch list of executed trades from ICICI Direct Breeze."""
+        day = day or datetime.now(IST).strftime("%Y-%m-%d")
+        from_d = f"{day}T06:00:00.000Z"
+        to_d = f"{day}T15:30:00.000Z"
+
+        trades = []
+        try:
+            res = self.breeze.get_trade_list(
+                from_date=from_d,
+                to_date=to_d,
+                exchange_code="NFO",
+                product_type="options",
+                action="buy",
+            )
+            if isinstance(res, dict) and res.get("Success"):
+                items = res["Success"] if isinstance(res["Success"], list) else [res["Success"]]
+                trades.extend(items)
+        except Exception as e:
+            log.warning("ICICI get_trade_list buy error: %s", e)
+
+        try:
+            res_sell = self.breeze.get_trade_list(
+                from_date=from_d,
+                to_date=to_d,
+                exchange_code="NFO",
+                product_type="options",
+                action="sell",
+            )
+            if isinstance(res_sell, dict) and res_sell.get("Success"):
+                items = res_sell["Success"] if isinstance(res_sell["Success"], list) else [res_sell["Success"]]
+                trades.extend(items)
+        except Exception:
+            pass
+
+        out = []
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            oid = str(t.get("order_id") or t.get("order_reference") or "")
+            tid = str(t.get("trade_id") or oid)
+            sec = str(t.get("stock_code") or "")
+            sym = str(t.get("stock_name") or sec)
+            px = float(t.get("execution_price") or t.get("price") or t.get("trade_price") or 0.0)
+            qty = int(float(t.get("quantity") or t.get("executed_quantity") or 0))
+            act = str(t.get("action") or "").upper()
+            tm = str(t.get("execution_time") or t.get("order_date") or "")
+            out.append({
+                "order_id": oid,
+                "trade_id": tid,
+                "security_id": sec,
+                "symbol": sym,
+                "price": px,
+                "qty": qty,
+                "action": act,
+                "time": tm,
+                "status": "EXECUTED",
+                "raw": t,
+            })
+        return out
+
+    def get_order_list(self, day: str | None = None) -> list[dict]:
+        """Fetch today's orders from ICICI Direct Breeze."""
+        day = day or datetime.now(IST).strftime("%Y-%m-%d")
+        try:
+            res = self.breeze.get_order_list(
+                exchange_code="NFO",
+                from_date=f"{day}T06:00:00.000Z",
+                to_date=f"{day}T15:30:00.000Z",
+            )
+            if isinstance(res, dict) and res.get("Success"):
+                items = res["Success"]
+                return items if isinstance(items, list) else [items]
+        except Exception as e:
+            log.warning("ICICI get_order_list error: %s", e)
+        return []
+
+    def get_positions(self) -> list[dict]:
+        """Fetch open portfolio positions from ICICI Direct Breeze."""
+        try:
+            res = self.breeze.get_portfolio_positions()
+            if isinstance(res, dict) and res.get("Success"):
+                items = res["Success"]
+                return items if isinstance(items, list) else [items]
+        except Exception as e:
+            log.warning("ICICI get_positions error: %s", e)
+        return []
 
 
 # ------------------------------------------------------- live WebSocket streaming

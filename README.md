@@ -1,7 +1,30 @@
-# F&O Opening-Range Momentum: Paper Trading MVP
+# F&O Opening-Range Momentum: Trading Bot (Paper & Live Modes)
 
-A small, Python-only (no JavaScript) paper-trading tool for NSE stock options.
-It supports **INDMoney (INDstocks API)** and **ICICI Direct (Breeze API)** and **cannot place orders** (read-only market data only).
+A Python trading bot for NSE stock options supporting **INDMoney (INDstocks API)** and **ICICI Direct (Breeze API)**.
+It features two distinct execution modes: **Paper Trading** (simulation) and **Live Trading** (real broker execution with wallet margin checks and trade reconciliation).
+
+## Trading Modes (`paper` vs `live`)
+
+You can set the mode in `.env`:
+```env
+TRADING_MODE=paper      # 'paper' for simulation (default)
+# or
+TRADING_MODE=live       # 'live' for real broker order execution
+```
+
+Or switch modes on the command line:
+```bash
+python run.py trade --live      # or python run.py trade --mode live
+python run.py trade --paper     # or python run.py trade --mode paper
+python run.py daemon --live     # run daily automation in live mode
+```
+
+### Live Mode Behavior
+1. **F&O Wallet Margin Check:** Before taking any trade, the bot checks your broker's available F&O margin.
+   - If available margin $\ge$ required premium (`price × lot_size × lots`): the order is executed.
+   - If margin is insufficient: the trade is skipped, an alert is displayed in the console, and recorded in `data/<date>/skipped.csv` with the exact required vs available margin.
+2. **Trade List Reconciliation:** After placing the order, the bot queries the broker's executed trade list to confirm the order fill price, quantity, and execution status.
+3. **Trailing Stop-Loss & Square-off:** Real-time WebSocket streaming watches the position tick-by-tick. Once price moves into profit, trailing stop-loss (TSL) is ratcheted up. When a stop loss, profit target, daily loss limit, or 15:00 force exit is hit, the bot automatically submits a market square-off order to the broker and reconciles the exit trade.
 
 ## Switching Brokers (`.env`)
 
