@@ -353,13 +353,17 @@ class INDMoney:
         log.info("[INDMoney] Placing %s order for %s (%s): %s", action, symbol, contract.security_id, payload)
         res = self._post("/order", payload=payload)
         order_id = ""
+        error_msg = ""
         if isinstance(res, dict):
             order_id = (res.get("order_id") or res.get("orderId") or res.get("order_no") or
                         (res.get("data") if isinstance(res.get("data"), dict) else {}).get("order_id") or
                         (res.get("result") if isinstance(res.get("result"), dict) else {}).get("order_id") or "")
+            if not order_id:
+                error_msg = str(res.get("message") or res.get("errorMessage") or res.get("error") or "")
         return {
             "order_id": str(order_id),
-            "status": "PLACED" if order_id else res.get("status", "SUBMITTED"),
+            "status": "PLACED" if order_id else "FAILED",
+            "error": error_msg,
             "raw": res,
         }
 
@@ -633,42 +637,93 @@ class ICICIDirect:
             _, stock_code, expiry_str, strike_str, opt_type = parts[:5]
         else:
             stock_code = symbol
-            expiry_str = contract.expiry.strftime("%d-%b-%Y")
+            expiry_str = contract.expiry.strftime("%d-%b-%Y") if isinstance(contract.expiry, (date, datetime)) else str(contract.expiry)
             strike_str = str(contract.strike)
             opt_type = contract.option_type
 
-        try:
-            exp_date = datetime.strptime(expiry_str.strip(), "%d-%b-%Y").strftime("%Y-%m-%dT06:00:00.000Z")
-        except ValueError:
-            exp_date = f"{expiry_str.strip()}T06:00:00.000Z" if "T" not in expiry_str else expiry_str.strip()
+        # Format expiry date strictly as DD-MMM-YYYY (e.g. 26-Nov-2026) required by Breeze place_order
+        exp_date = ""
+        if isinstance(getattr(contract, "expiry", None), (date, datetime)):
+            exp_date = contract.expiry.strftime("%d-%b-%Y")
+        elif expiry_str:
+            clean_exp = expiry_str.strip().split("T")[0]
+            for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    exp_date = datetime.strptime(clean_exp, fmt).strftime("%d-%b-%Y")
+                    break
+                except ValueError:
+                    pass
+            if not exp_date:
+                exp_date = clean_exp
 
-        log.info("[ICICI Breeze] Placing %s order for %s (%s, strike=%s, right=%s, qty=%s, price=%s)",
-                 action, stock_code, exp_date, strike_str, opt_type, qty, price)
+        # Format strike without trailing '.0' (e.g. 1820 instead of 1820.0)
+        try:
+            s_val = float(strike_str)
+            clean_strike = f"{s_val:g}" if s_val.is_integer() else f"{s_val:.2f}"
+        except (ValueError, TypeError):
+            clean_strike = str(strike_str).strip()
+
+        # In NSE F&O options, raw market orders are prohibited/rejected by exchange rules.
+        # Breeze SDK converts order_type='market' into an aggressive limit order by calling
+        # get_aggressive_limit_price(), which fails if depth quotes are not immediately available.
+        # When price > 0, we send order_type='limit' with a 2% marketable buffer (aligned to 0.05 tick)
+        # to ensure instant fill without risking a 'Quotes not available' SDK rejection.
+        eff_order_type = order_type.lower()
+        if eff_order_type == "market" and price > 0:
+            eff_order_type = "limit"
+            if action.lower() == "buy":
+                eff_price = round(round(price * 1.02 / 0.05) * 0.05, 2)
+            else:
+                eff_price = round(round(price * 0.98 / 0.05) * 0.05, 2)
+        elif price > 0:
+            eff_price = round(round(price / 0.05) * 0.05, 2)
+        else:
+            eff_price = 0.0
+
+        log.info("[ICICI Breeze] Placing %s %s order for %s (expiry=%s, strike=%s, right=%s, qty=%s, price=%s)",
+                 action, eff_order_type, stock_code, exp_date, clean_strike, opt_type, qty, eff_price)
 
         res = self.breeze.place_order(
             stock_code=stock_code,
             exchange_code="NFO",
             product="options",
             action=action.lower(),
-            order_type=order_type.lower(),
+            order_type=eff_order_type,
             quantity=str(qty),
-            price=str(round(price, 2)) if price > 0 else "0",
+            price=str(eff_price) if eff_price > 0 else "0",
             validity="day",
             expiry_date=exp_date,
             right="call" if opt_type.upper() == "CE" else "put",
-            strike_price=str(strike_str),
+            strike_price=str(clean_strike),
         )
 
         order_id = ""
+        error_msg = ""
         if isinstance(res, dict):
             success = res.get("Success")
             if isinstance(success, dict):
-                order_id = success.get("order_id") or success.get("order_reference") or ""
-            elif isinstance(success, str):
-                order_id = success
+                order_id = str(success.get("order_id") or success.get("order_reference") or "")
+            elif isinstance(success, str) and success.strip():
+                order_id = success.strip()
+
+            if not order_id:
+                order_id = str(res.get("order_id") or res.get("orderId") or "")
+
+            error_msg = str(res.get("Error") or res.get("message") or "")
+            if not order_id and not error_msg:
+                error_msg = f"No order ID in broker response: {res}"
+        else:
+            error_msg = f"Unexpected response from broker: {res}"
+
+        if not order_id:
+            log.error("[ICICI Breeze] Order placement failed: %s | Raw response: %s", error_msg, res)
+        else:
+            log.info("[ICICI Breeze] Order successfully placed with Order ID: %s", order_id)
+
         return {
             "order_id": str(order_id),
-            "status": "PLACED" if order_id else (res.get("Error") or "FAILED"),
+            "status": "PLACED" if order_id else "FAILED",
+            "error": error_msg,
             "raw": res,
         }
 

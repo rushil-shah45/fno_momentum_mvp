@@ -166,7 +166,17 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
             try:
                 order_res = broker.place_order(m["symbol"], contract, action="BUY", qty=pos.qty,
                                                price=pos.entry, order_type="MARKET")
-                order_id = str(order_res.get("order_id") or "")
+                order_id = str(order_res.get("order_id") or "").strip()
+                error_msg = str(order_res.get("error") or order_res.get("status") or "")
+
+                if not order_id or order_id == "None":
+                    raw_err = order_res.get("raw")
+                    err_detail = error_msg if error_msg and error_msg != "FAILED" else f"Broker response: {raw_err}"
+                    print(f"\n[LIVE ORDER FAILED] {pos.symbol} BUY {pos.qty} {contract.option_type} {contract.strike} failed!")
+                    print(f"    Broker Error: {err_detail}")
+                    skipped.append((m["symbol"], f"order rejected by broker: {err_detail}"))
+                    continue
+
                 pos.order_id = order_id
                 print(f"[LIVE ORDER PLACED] {pos.symbol} BUY {pos.qty} {contract.option_type} {contract.strike} (Order ID: {order_id})")
 
@@ -182,7 +192,7 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
                         if order_id and t_oid == order_id:
                             matched_trade = t
                             break
-                        if t.get("action", "").upper() == "BUY" and (m["symbol"] in t_sym or t_sec in contract.security_id):
+                        if t.get("action", "").upper() == "BUY" and (m["symbol"] in t_sym or t_sec in contract.security_id or t_sym in contract.security_id):
                             matched_trade = t
                             break
 
@@ -195,7 +205,22 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
                             print(f"[LIVE TRADE CONFIRMED] Broker trade list verified: {pos.symbol} filled at Rs {exec_px:.2f} "
                                   f"(Trade ID: {matched_trade.get('trade_id', order_id)}, Qty: {pos.qty})")
                     else:
-                        print(f"[LIVE TRADE OBSERVED] Watching live position {pos.symbol} from broker with entry Rs {pos.entry:.2f}")
+                        # Check order book status too
+                        try:
+                            orders = broker.get_order_list(today())
+                            matched_order = next((o for o in orders if str(o.get("order_id") or o.get("order_reference") or "") == order_id), None)
+                            if matched_order:
+                                ord_status = str(matched_order.get("status") or matched_order.get("order_status") or "").upper()
+                                avg_px = float(matched_order.get("average_price") or matched_order.get("price") or 0.0)
+                                if avg_px > 0:
+                                    pos.entry = avg_px
+                                    pos.executed_entry = avg_px
+                                    pos.risk = abs(pos.entry - pos.initial_stop)
+                                print(f"[LIVE ORDER STATUS] Order {order_id} on broker: {ord_status} (Avg Price: Rs {pos.entry:.2f})")
+                            else:
+                                print(f"[LIVE TRADE OBSERVED] Watching live position {pos.symbol} from broker with entry Rs {pos.entry:.2f}")
+                        except Exception:
+                            print(f"[LIVE TRADE OBSERVED] Watching live position {pos.symbol} from broker with entry Rs {pos.entry:.2f}")
                 except Exception as t_err:
                     print(f"[LIVE TRADE LIST] Could not verify broker trade list for {pos.symbol}: {t_err}")
             except Exception as e:
@@ -322,15 +347,18 @@ class LiveTradeSession:
                             exit_res = self.broker.place_order(pos.symbol, pos.contract, action="SELL",
                                                                qty=pos.qty, price=price, order_type="MARKET")
                             pos.exit_order_id = str(exit_res.get("order_id", ""))
-                            time.sleep(0.5)
-                            exit_trades = self.broker.get_trade_list(today())
-                            matched_exit = next((t for t in exit_trades if str(t.get("order_id")) == pos.exit_order_id or
-                                                (t.get("action") == "SELL" and pos.symbol in str(t.get("symbol", "")))), None)
-                            if matched_exit and float(matched_exit.get("price") or 0) > 0:
-                                pos.exit_price = float(matched_exit["price"])
-                                pos.executed_exit = pos.exit_price
-                            print(f"\n[LIVE STOP HIT] {pos.symbol} stop loss hit at Rs {price:.2f} -> Closed on broker "
-                                  f"(Order ID: {pos.exit_order_id}, Exit: Rs {pos.exit_price:.2f})")
+                            if not pos.exit_order_id:
+                                print(f"\n[LIVE STOP ERROR] Broker square-off failed: {exit_res.get('error') or exit_res.get('raw')}")
+                            else:
+                                time.sleep(0.5)
+                                exit_trades = self.broker.get_trade_list(today())
+                                matched_exit = next((t for t in exit_trades if str(t.get("order_id")) == pos.exit_order_id or
+                                                    (t.get("action") == "SELL" and pos.symbol in str(t.get("symbol", "")))), None)
+                                if matched_exit and float(matched_exit.get("price") or 0) > 0:
+                                    pos.exit_price = float(matched_exit["price"])
+                                    pos.executed_exit = pos.exit_price
+                                print(f"\n[LIVE STOP HIT] {pos.symbol} stop loss hit at Rs {price:.2f} -> Closed on broker "
+                                      f"(Order ID: {pos.exit_order_id}, Exit: Rs {pos.exit_price:.2f})")
                         except Exception as e:
                             print(f"\n[LIVE STOP ERROR] Failed to close {pos.symbol} on broker: {e}")
                     else:
@@ -349,8 +377,11 @@ class LiveTradeSession:
                                 exit_res = self.broker.place_order(pos.symbol, pos.contract, action="SELL",
                                                                    qty=pos.qty, price=pos.stop, order_type="MARKET")
                                 pos.exit_order_id = str(exit_res.get("order_id", ""))
-                                print(f"\n[LIVE BAR STOP] {pos.symbol} stopped out at Rs {pos.stop:.2f} -> Closed on broker "
-                                      f"(Order ID: {pos.exit_order_id})")
+                                if not pos.exit_order_id:
+                                    print(f"\n[LIVE STOP ERROR] Broker square-off failed: {exit_res.get('error') or exit_res.get('raw')}")
+                                else:
+                                    print(f"\n[LIVE BAR STOP] {pos.symbol} stopped out at Rs {pos.stop:.2f} -> Closed on broker "
+                                          f"(Order ID: {pos.exit_order_id})")
                             except Exception as e:
                                 print(f"\n[LIVE STOP ERROR] Failed to close {pos.symbol} on broker: {e}")
                     elif pos.status == "OPEN" and pos.trailing and pos.stop != prev_stop:
