@@ -4,7 +4,7 @@
     python run.py universe          # once a day (or week): list F&O stocks
     python run.py scan              # at ~09:20 IST: find setups + top movers
     python run.py trade             # after 09:20: paper-trade the movers' ATM options
-    python run.py trade --watch     # same, refreshing every minute until force exit
+    python run.py trade --watch     # same, 10s status check and 30s signal refresh until force exit
     python run.py daemon            # run ONCE; does all of the above every trading day (08:55 login)
     python run.py dashboard         # web dashboard at http://127.0.0.1:8501
 """
@@ -28,6 +28,7 @@ from strategy import (IST, CandleAggregator, OpeningRange, Position, classify, f
                       open_position, pick_atm, rank_movers, run_session)
 
 DATA = ROOT / "data"
+log = logging.getLogger("run")
 
 
 class NoMarketData(Exception):
@@ -135,17 +136,136 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
 
 
 # ------------------------------------------------------------------------ trade
-def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> list[Position]:
-    positions, later, skipped = [], {}, []
+def load_existing_positions(day_str: str, picks: dict[str, Contract]) -> list[Position]:
+    """Load existing trades for the day from trades.csv to preserve open/closed positions."""
+    trades_path = DATA / day_str / "trades.csv"
+    if not trades_path.exists():
+        return []
+    positions = []
+    try:
+        with trades_path.open(encoding="utf-8") as fh:
+            for r in csv.DictReader(fh):
+                sym = r.get("symbol")
+                if not sym or sym not in picks:
+                    continue
+                contract = picks[sym]
+                try:
+                    lots = int(r.get("lots") or 1)
+                    entry = float(r.get("entry") or 0.0)
+                    initial_stop = float(r.get("initial_stop") or 0.0)
+                    stop = float(r.get("stop_now") or initial_stop)
+                    last_px = float(r.get("exit_or_last") or entry)
+                    risk = abs(entry - initial_stop) if abs(entry - initial_stop) > 0 else 1.0
+                    status = r.get("status") or "OPEN"
+                    pos = Position(
+                        symbol=sym,
+                        direction=r.get("direction", "CALL"),
+                        contract=contract,
+                        lots=lots,
+                        entry_ts=int(datetime.now(IST).timestamp()),
+                        entry=entry,
+                        initial_stop=initial_stop,
+                        stop=stop,
+                        risk=risk,
+                        trailing=(r.get("trailing") == "True"),
+                        status=status,
+                        last_price=last_px,
+                        mode=r.get("mode", "paper"),
+                        order_id=r.get("order_id", ""),
+                        exit_order_id=r.get("exit_order_id", ""),
+                    )
+                    if status != "OPEN":
+                        pos.exit_price = last_px
+                        pos.exit_ts = int(datetime.now(IST).timestamp())
+                    positions.append(pos)
+                except (ValueError, TypeError):
+                    continue
+    except Exception:
+        pass
+    return positions
+
+
+def is_script_open(symbol: str, contract: Contract | None = None,
+                   positions: list[Position] | None = None,
+                   broker = None, day_str: str | None = None) -> bool:
+    """Return True if the script is currently in an open position in:
+    1. The in-memory positions list (status == 'OPEN')
+    2. Today's trades.csv file (status == 'OPEN')
+    3. The broker's open portfolio/derivative positions (net_qty > 0)
+    """
+    # 1. Check in-memory positions list
+    if positions:
+        for p in positions:
+            if p.symbol == symbol and p.status == "OPEN":
+                return True
+
+    # 2. Check today's trades.csv file
+    day_str = day_str or today()
+    trades_path = DATA / day_str / "trades.csv"
+    if trades_path.exists():
+        try:
+            with trades_path.open(encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    if row.get("symbol") == symbol and row.get("status") == "OPEN":
+                        return True
+        except Exception:
+            pass
+
+    # 3. Check broker's open positions if broker is provided and has get_positions()
+    if broker and hasattr(broker, "get_positions"):
+        try:
+            b_positions = broker.get_positions()
+            if isinstance(b_positions, list):
+                for bp in b_positions:
+                    if not isinstance(bp, dict):
+                        continue
+                    sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
+                    sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
+                    net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
+                    if net_qty > 0:
+                        matched = False
+                        if symbol and (symbol in sym or symbol in sec_id):
+                            matched = True
+                        elif contract and (contract.security_id in sec_id or sec_id in contract.security_id):
+                            if not sym or (symbol and symbol in sym):
+                                matched = True
+                        if matched:
+                            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
+                  existing_positions: list[Position] | None = None) -> list[Position]:
+    positions = list(existing_positions) if existing_positions is not None else []
+    existing_symbols = {p.symbol for p in positions if p.status == "OPEN"}
+    later, skipped = {}, []
     is_live = (getattr(cfg, "trading_mode", "paper") == "live")
 
+    # If no existing_positions was explicitly passed, load existing today's positions from trades.csv
+    if existing_positions is None:
+        for p in load_existing_positions(today(), picks):
+            positions.append(p)
+            if p.status == "OPEN":
+                existing_symbols.add(p.symbol)
+
     for m in movers:
-        contract = picks[m["symbol"]]
+        sym = m["symbol"]
+        contract = picks[sym]
+
+        # Check if the script is in an open position
+        if sym in existing_symbols or is_script_open(sym, contract, positions, broker if is_live else None):
+            print(f"[OPEN POSITION EXISTS] Script {sym} is already in an OPEN position. Skipping new entry.")
+            skipped.append((sym, "already in open position"))
+            continue
+
         bars = broker.option_candles(contract.security_id, today())
-        pos, rest, why = open_position(m["symbol"], m["direction"], contract, bars,
+        pos, rest, why = open_position(sym, m["direction"], contract, bars,
                                        cfg.max_risk_per_trade, cfg.enforce_risk_limit)
         if pos is None:
-            skipped.append((m["symbol"], why))
+            skipped.append((sym, why))
             continue
 
         if is_live:
@@ -154,17 +274,17 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
             has_margin, req_margin, avail_margin = broker.check_margin_available(contract, pos.entry, pos.lots)
             if not has_margin:
                 msg = f"insufficient F&O margin (required: Rs {req_margin:,.2f}, available: Rs {avail_margin:,.2f})"
-                print(f"[MARGIN NOT AVAILABLE] {m['symbol']} {contract.option_type} {contract.strike}: "
+                print(f"[MARGIN NOT AVAILABLE] {sym} {contract.option_type} {contract.strike}: "
                       f"Required Margin = Rs {req_margin:,.2f}, Available F&O Margin = Rs {avail_margin:,.2f}. "
                       f"Trade not taken.")
-                skipped.append((m["symbol"], msg))
+                skipped.append((sym, msg))
                 continue
 
-            print(f"[MARGIN AVAILABLE] {m['symbol']} {contract.option_type} {contract.strike}: "
+            print(f"[MARGIN AVAILABLE] {sym} {contract.option_type} {contract.strike}: "
                   f"Required Margin = Rs {req_margin:,.2f}, Available F&O Margin = Rs {avail_margin:,.2f}. "
                   f"Taking live trade...")
             try:
-                order_res = broker.place_order(m["symbol"], contract, action="BUY", qty=pos.qty,
+                order_res = broker.place_order(sym, contract, action="BUY", qty=pos.qty,
                                                price=pos.entry, order_type="MARKET")
                 order_id = str(order_res.get("order_id") or "").strip()
                 error_msg = str(order_res.get("error") or order_res.get("status") or "")
@@ -174,7 +294,7 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
                     err_detail = error_msg if error_msg and error_msg != "FAILED" else f"Broker response: {raw_err}"
                     print(f"\n[LIVE ORDER FAILED] {pos.symbol} BUY {pos.qty} {contract.option_type} {contract.strike} failed!")
                     print(f"    Broker Error: {err_detail}")
-                    skipped.append((m["symbol"], f"order rejected by broker: {err_detail}"))
+                    skipped.append((sym, f"order rejected by broker: {err_detail}"))
                     continue
 
                 pos.order_id = order_id
@@ -192,7 +312,7 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
                         if order_id and t_oid == order_id:
                             matched_trade = t
                             break
-                        if t.get("action", "").upper() == "BUY" and (m["symbol"] in t_sym or t_sec in contract.security_id or t_sym in contract.security_id):
+                        if t.get("action", "").upper() == "BUY" and (sym in t_sym or t_sec in contract.security_id or t_sym in contract.security_id):
                             matched_trade = t
                             break
 
@@ -225,13 +345,14 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict) -> lis
                     print(f"[LIVE TRADE LIST] Could not verify broker trade list for {pos.symbol}: {t_err}")
             except Exception as e:
                 err_msg = f"Order placement failed: {e}"
-                print(f"[LIVE ORDER ERROR] {m['symbol']}: {err_msg}")
-                skipped.append((m["symbol"], err_msg))
+                print(f"[LIVE ORDER ERROR] {sym}: {err_msg}")
+                skipped.append((sym, err_msg))
                 continue
         else:
             pos.mode = "paper"
 
         positions.append(pos)
+        existing_symbols.add(pos.symbol)
         later[pos.symbol] = rest
 
     note = run_session(positions, later, cfg.max_daily_loss, cfg.force_exit)
@@ -287,7 +408,9 @@ def load_movers() -> list[dict]:
 
 
 class LiveTradeSession:
-    """Manages real-time WebSocket watching, tick-by-tick stops, candle aggregation, and live P&L updates."""
+    """Manages real-time WebSocket watching, tick-by-tick stops, 10s trade & position status checking,
+    30s candidate signal refreshes, candle aggregation, and live P&L updates.
+    """
 
     def __init__(self, cfg: Settings, broker, movers: list[dict], picks: dict,
                  initial_positions: list[Position]):
@@ -300,6 +423,8 @@ class LiveTradeSession:
         self.lock = threading.Lock()
         self.last_csv_write = 0.0
         self.last_tick_time = time.time()
+        self.last_10s_check = 0.0
+        self.last_30s_refresh = 0.0
         self.stream = None
         self.skipped: list[tuple[str, str]] = []
 
@@ -409,31 +534,222 @@ class LiveTradeSession:
                 self._persist()
                 self.last_csv_write = now
 
-    def run(self) -> list[Position]:
-        contracts = list(self.picks.values())
-        try:
-            self.stream = get_stream(self.broker, contracts, on_tick=self.on_tick)
-            self.stream.start()
-            print(f"\n[WS] WebSocket live stream active for {len(contracts)} contracts.")
-            print("[WS] Watching positions in real-time (instant stop-loss active)...")
-        except Exception as err:
-            print(f"\n[WS] WebSocket streaming unavailable ({err}). Falling back to REST polling.")
-            return self._fallback_polling()
+    def check_status_10s(self) -> dict[str, dict]:
+        """Check trade status or open position status for each selected script every 10 seconds.
+        Queries broker orders/trades/positions (in live mode or when available),
+        updates local position state, and logs real-time status.
+        """
+        now_ts = int(time.time())
+        status_report = {}
+        is_live = (getattr(self.cfg, "trading_mode", "paper") == "live")
 
-        try:
-            while datetime.now(IST).time() < self.cfg.force_exit:
-                time.sleep(1)
-                # If no ticks received for 90s, re-check or sync via REST
-                if time.time() - self.last_tick_time > 90:
-                    self.last_tick_time = time.time()
+        broker_orders = []
+        broker_trades = []
+        broker_positions = []
+        if is_live and self.broker:
+            try:
+                broker_orders = self.broker.get_order_list(today()) or []
+            except Exception as e:
+                log.debug("10s check: error fetching order list: %s", e)
+            try:
+                broker_trades = self.broker.get_trade_list(today()) or []
+            except Exception as e:
+                log.debug("10s check: error fetching trade list: %s", e)
+            try:
+                broker_positions = self.broker.get_positions() or []
+            except Exception as e:
+                log.debug("10s check: error fetching positions: %s", e)
+
+        time_str = datetime.now(IST).strftime("%H:%M:%S")
+        print(f"\n[10s STATUS CHECK] Checking trade & open position status ({time_str}):")
+
+        with self.lock:
+            for m in self.movers:
+                sym = m["symbol"]
+                contract = self.picks.get(sym)
+                pos = self._get_position(sym)
+
+                trade_status = "NO_ORDER"
+                position_status = "NO_POSITION"
+
+                if pos:
+                    trade_status = f"ORDER_PLACED ({pos.order_id})" if pos.order_id else "PAPER_ACTIVE"
+                    position_status = pos.status
+
+                    # Sync live orders if live mode
+                    if is_live and pos.order_id:
+                        matched_order = next((o for o in broker_orders if str(o.get("order_id") or o.get("order_reference") or "") == pos.order_id), None)
+                        if matched_order:
+                            ord_st = str(matched_order.get("status") or matched_order.get("order_status") or "").upper()
+                            trade_status = f"ORDER_{ord_st} ({pos.order_id})"
+                            avg_px = float(matched_order.get("average_price") or matched_order.get("price") or 0.0)
+                            if avg_px > 0 and pos.executed_entry is None:
+                                pos.executed_entry = avg_px
+                                pos.entry = avg_px
+                                pos.risk = abs(pos.entry - pos.initial_stop)
+
+                            if ord_st in ("REJECTED", "CANCELLED") and pos.status == "OPEN":
+                                pos.close(0.0, now_ts, f"ORDER_{ord_st}")
+                                position_status = pos.status
+
+                        if pos.exit_order_id:
+                            matched_exit = next((o for o in broker_orders if str(o.get("order_id") or o.get("order_reference") or "") == pos.exit_order_id), None)
+                            if matched_exit:
+                                exit_st = str(matched_exit.get("status") or matched_exit.get("order_status") or "").upper()
+                                trade_status += f" | EXIT_{exit_st} ({pos.exit_order_id})"
+
+                    # Check broker open derivative positions
+                    if is_live and broker_positions and contract:
+                        b_match = None
+                        for bp in broker_positions:
+                            sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
+                            b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
+                            if sym in b_sym or (contract.security_id in sec_id or sec_id in contract.security_id):
+                                b_match = bp
+                                break
+
+                        if b_match:
+                            net_qty = float(b_match.get("net_qty") or b_match.get("netQty") or b_match.get("net_quantity") or b_match.get("quantity") or b_match.get("qty") or 0.0)
+                            if net_qty > 0:
+                                position_status = f"OPEN (Broker Qty: {int(net_qty)})"
+                            elif net_qty == 0 and pos.status == "OPEN":
+                                pos.close(pos.last_price, now_ts, "EXIT_EXTERNAL")
+                                position_status = "CLOSED_ON_BROKER"
+
+                    if pos.status == "OPEN":
+                        print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16} | "
+                              f"Entry: Rs {pos.entry:>7.2f} | LTP: Rs {pos.last_price:>7.2f} | Stop: Rs {pos.stop:>7.2f} | P&L: Rs {pos.pnl:>+8.2f}")
+                    else:
+                        print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {pos.status:<16} | "
+                              f"Exit: Rs {pos.exit_price or pos.last_price:>7.2f} | P&L: Rs {pos.pnl:>+8.2f}")
+                else:
+                    # Check if broker shows an open position for it even without local pos
+                    broker_has_pos = False
+                    if is_live and broker_positions and contract:
+                        for bp in broker_positions:
+                            sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
+                            b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
+                            net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
+                            if net_qty > 0 and (sym in b_sym or (contract.security_id in sec_id or sec_id in contract.security_id)):
+                                broker_has_pos = True
+                                break
+                    if broker_has_pos:
+                        trade_status = "EXTERNAL"
+                        position_status = "OPEN_ON_BROKER"
+                        print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16}")
+                    else:
+                        trade_status = "WAITING_BREAKOUT"
+                        position_status = "NONE"
+                        print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16}")
+
+                status_report[sym] = {
+                    "trade_status": trade_status,
+                    "position_status": position_status,
+                    "position": pos,
+                }
+
+            self._persist()
+        return status_report
+
+    def refresh_30s(self) -> list[Position]:
+        """30-second refresh to check candidate scripts.
+        If the script is in open position, it will NOT take that script again.
+        If not in open position, checks for confirmation breakout candle and enters if qualified.
+        """
+        time_str = datetime.now(IST).strftime("%H:%M:%S")
+        print(f"\n[30s REFRESH] Checking selected scripts (30s refresh cycle at {time_str})...")
+        newly_opened = []
+        is_live = (getattr(self.cfg, "trading_mode", "paper") == "live")
+
+        for m in self.movers:
+            sym = m["symbol"]
+            contract = self.picks.get(sym)
+            if not contract:
+                continue
+
+            pos = self._get_position(sym)
+            # CRITICAL: If the script is in open position, it will not take that script again even after 30s refreshed
+            if (pos and pos.status == "OPEN") or is_script_open(sym, contract, self.positions, self.broker if is_live else None):
+                print(f"  [30s REFRESH] Script {sym} is in OPEN position -> will not take that script again.")
+                continue
+
+            # If position was already taken and closed today, do not re-enter on old signal
+            if pos and pos.status != "OPEN":
+                print(f"  [30s REFRESH] Script {sym} was already traded today (Status: {pos.status}). Skipping.")
+                continue
+
+            # Script is not in open position and has not entered yet: check if breakout confirmation occurred
+            try:
+                bars = self.broker.option_candles(contract.security_id, today())
+                new_pos, rest, why = open_position(sym, m["direction"], contract, bars,
+                                                   self.cfg.max_risk_per_trade, self.cfg.enforce_risk_limit)
+                if new_pos is None:
+                    print(f"  [30s REFRESH] Script {sym}: {why}")
+                    continue
+
+                if is_live:
+                    new_pos.mode = "live"
+                    has_margin, req_margin, avail_margin = self.broker.check_margin_available(
+                        contract, new_pos.entry, new_pos.lots
+                    )
+                    if not has_margin:
+                        msg = f"insufficient F&O margin (required: Rs {req_margin:,.2f}, available: Rs {avail_margin:,.2f})"
+                        print(f"  [MARGIN NOT AVAILABLE] {sym} {contract.option_type} {contract.strike}: {msg}. Trade not taken.")
+                        self.skipped.append((sym, msg))
+                        continue
+
+                    order_res = self.broker.place_order(sym, contract, action="BUY", qty=new_pos.qty,
+                                                        price=new_pos.entry, order_type="MARKET")
+                    order_id = str(order_res.get("order_id") or "").strip()
+                    if not order_id or order_id == "None":
+                        err = order_res.get("error") or order_res.get("raw")
+                        print(f"  [LIVE ORDER FAILED] {sym} BUY {new_pos.qty} failed: {err}")
+                        self.skipped.append((sym, f"order rejected: {err}"))
+                        continue
+
+                    new_pos.order_id = order_id
+                    print(f"  [LIVE ORDER PLACED] {sym} BUY {new_pos.qty} {contract.option_type} {contract.strike} (Order ID: {order_id})")
+
+                    time.sleep(1)
                     try:
-                        self.positions = simulate_once(self.cfg, self.broker, self.movers, self.picks)
-                    except Exception:
-                        pass
-        finally:
-            if self.stream:
-                self.stream.stop()
+                        trades = self.broker.get_trade_list(today())
+                        matched = next((t for t in trades if str(t.get("order_id") or "") == order_id or
+                                        (t.get("action", "").upper() == "BUY" and sym in str(t.get("symbol", "")))), None)
+                        if matched and float(matched.get("price") or 0) > 0:
+                            exec_px = float(matched["price"])
+                            new_pos.entry = exec_px
+                            new_pos.executed_entry = exec_px
+                            new_pos.risk = abs(new_pos.entry - new_pos.initial_stop)
+                            print(f"  [LIVE TRADE CONFIRMED] {sym} filled at Rs {exec_px:.2f} (Trade ID: {matched.get('trade_id', order_id)})")
+                    except Exception as e:
+                        print(f"  [LIVE TRADE LIST] Could not verify trade list for {sym}: {e}")
+                else:
+                    new_pos.mode = "paper"
 
+                with self.lock:
+                    self.positions.append(new_pos)
+                newly_opened.append(new_pos)
+                self._persist()
+                print(f"  [30s REFRESH] New trade taken for {sym}: Entry Rs {new_pos.entry:.2f}, Stop Rs {new_pos.stop:.2f}")
+            except Exception as e:
+                print(f"  [30s REFRESH] Error evaluating {sym}: {e}")
+
+        return newly_opened
+
+    def _poll_quotes(self) -> None:
+        """Poll latest quotes from broker to advance ticks / stops."""
+        try:
+            sids = [c.security_id for c in self.picks.values()]
+            quotes = self.broker.quotes(sids)
+            now_ts = int(time.time())
+            for sid, q in quotes.items():
+                lp = float(q.get("last_price") or 0.0)
+                if lp > 0:
+                    self.on_tick(sid, lp, now_ts)
+        except Exception as e:
+            log.debug("Quote poll error: %s", e)
+
+    def _force_close_at_exit(self) -> list[Position]:
         with self.lock:
             now_ts = int(datetime.now(IST).timestamp())
             for p in self.positions:
@@ -451,12 +767,65 @@ class LiveTradeSession:
             print_report(self.positions, self.skipped, "force-exit time reached", mode=self.cfg.trading_mode)
         return self.positions
 
+    def run(self) -> list[Position]:
+        contracts = list(self.picks.values())
+        try:
+            self.stream = get_stream(self.broker, contracts, on_tick=self.on_tick)
+            self.stream.start()
+            print(f"\n[WS] WebSocket live stream active for {len(contracts)} contracts.")
+            print("[WS] Watching positions in real-time (instant stop-loss active)...")
+        except Exception as err:
+            print(f"\n[WS] WebSocket streaming unavailable ({err}). Falling back to REST polling.")
+            return self._fallback_polling()
+
+        self.last_10s_check = time.time()
+        self.last_30s_refresh = time.time()
+
+        try:
+            while datetime.now(IST).time() < self.cfg.force_exit:
+                time.sleep(1)
+                now = time.time()
+
+                # Every 10 seconds: check trade status or open position status
+                if now - self.last_10s_check >= 10.0:
+                    self.last_10s_check = now
+                    self.check_status_10s()
+
+                # Every 30 seconds: refresh candidate scripts (will not take open scripts again)
+                if now - self.last_30s_refresh >= 30.0:
+                    self.last_30s_refresh = now
+                    self.refresh_30s()
+
+                # If no ticks received for 90s, poll quotes via REST
+                if time.time() - self.last_tick_time > 90:
+                    self.last_tick_time = time.time()
+                    self._poll_quotes()
+        finally:
+            if self.stream:
+                self.stream.stop()
+
+        return self._force_close_at_exit()
+
     def _fallback_polling(self) -> list[Position]:
-        while True:
-            self.positions = simulate_once(self.cfg, self.broker, self.movers, self.picks)
-            if datetime.now(IST).time() >= self.cfg.force_exit:
-                return self.positions
-            time.sleep(60)
+        self.last_10s_check = time.time()
+        self.last_30s_refresh = time.time()
+
+        while datetime.now(IST).time() < self.cfg.force_exit:
+            time.sleep(1)
+            now = time.time()
+
+            # Every 10 seconds: check status and update quotes
+            if now - self.last_10s_check >= 10.0:
+                self.last_10s_check = now
+                self.check_status_10s()
+                self._poll_quotes()
+
+            # Every 30 seconds: refresh candidate scripts (will not take open scripts again)
+            if now - self.last_30s_refresh >= 30.0:
+                self.last_30s_refresh = now
+                self.refresh_30s()
+
+        return self._force_close_at_exit()
 
 
 def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
@@ -580,7 +949,7 @@ def main() -> None:
     scan = sub.add_parser("scan")
     scan.add_argument("--history", action="store_true", help="force historical candles")
     trade = sub.add_parser("trade")
-    trade.add_argument("--watch", action="store_true", help="refresh every minute")
+    trade.add_argument("--watch", action="store_true", help="watch live positions with 10s status check and 30s signal refresh")
     trade.add_argument("--mode", type=str, choices=["paper", "live"], default=None, help="trading mode ('paper' or 'live')")
     trade.add_argument("--live", action="store_true", help="run in live trading mode with real broker orders")
     trade.add_argument("--paper", action="store_true", help="run in paper trading mode (simulation)")

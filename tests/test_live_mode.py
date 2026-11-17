@@ -336,5 +336,201 @@ class LiveModeExecutionTests(unittest.TestCase):
         )
 
 
+class PositionStatusAndRefreshTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patch_data = mock.patch.object(run, "DATA", Path(self.tmp.name))
+        self.patch_data.start()
+        self.contract = Contract("NFO_51011", "CE", date(2026, 11, 26), 2800.0, 250)
+
+    def tearDown(self):
+        self.patch_data.stop()
+        self.tmp.cleanup()
+
+    def test_is_script_open_in_memory(self):
+        pos_open = Position("RELIANCE", "CALL", self.contract, 1, 1000, 100.0, 95.0, 95.0, 5.0, status="OPEN")
+        pos_closed = Position("TCS", "CALL", self.contract, 1, 1000, 100.0, 95.0, 95.0, 5.0, status="EXIT_STOP")
+
+        self.assertTrue(run.is_script_open("RELIANCE", self.contract, [pos_open]))
+        self.assertFalse(run.is_script_open("TCS", self.contract, [pos_closed]))
+        self.assertFalse(run.is_script_open("INFY", self.contract, [pos_open]))
+
+    def test_is_script_open_in_trades_csv(self):
+        day = "2026-11-09"
+        trades_dir = Path(self.tmp.name) / day
+        trades_dir.mkdir(parents=True, exist_ok=True)
+        trades_file = trades_dir / "trades.csv"
+
+        with mock.patch("run.today", return_value=day):
+            # No file yet
+            self.assertFalse(run.is_script_open("RELIANCE", self.contract))
+
+            # Write trades.csv with OPEN position
+            run.write_csv(trades_file, [{
+                "symbol": "RELIANCE", "direction": "CALL", "option": "CE", "strike": 2800.0,
+                "expiry": "2026-11-26", "lots": 1, "qty": 250, "capital_used": 25000.0,
+                "entry_time": "09:20:00", "entry": 100.0, "initial_stop": 95.0, "stop_now": 95.0,
+                "exit_time": "", "exit_or_last": 102.0, "pnl": 500.0, "r_multiple": 0.4,
+                "trailing": "False", "status": "OPEN", "mode": "live", "order_id": "ORD1",
+                "exit_order_id": ""
+            }])
+            self.assertTrue(run.is_script_open("RELIANCE", self.contract))
+            self.assertFalse(run.is_script_open("INFY", self.contract))
+
+            # Update to EXIT_STOP
+            run.write_csv(trades_file, [{
+                "symbol": "RELIANCE", "direction": "CALL", "option": "CE", "strike": 2800.0,
+                "expiry": "2026-11-26", "lots": 1, "qty": 250, "capital_used": 25000.0,
+                "entry_time": "09:20:00", "entry": 100.0, "initial_stop": 95.0, "stop_now": 95.0,
+                "exit_time": "10:00:00", "exit_or_last": 95.0, "pnl": -1250.0, "r_multiple": -1.0,
+                "trailing": "False", "status": "EXIT_STOP", "mode": "live", "order_id": "ORD1",
+                "exit_order_id": "EXIT1"
+            }])
+            self.assertFalse(run.is_script_open("RELIANCE", self.contract))
+
+    def test_is_script_open_broker_positions(self):
+        mock_broker = mock.MagicMock()
+        mock_broker.get_positions.return_value = [
+            {"security_id": "51011", "symbol": "RELIANCE26NOV2800CE", "net_qty": 250}
+        ]
+
+        infy_contract = Contract("NFO_52000", "CE", date(2026, 11, 26), 1800.0, 400)
+        with mock.patch("run.today", return_value="2026-11-09"):
+            self.assertTrue(run.is_script_open("RELIANCE", self.contract, broker=mock_broker))
+            self.assertFalse(run.is_script_open("INFY", infy_contract, broker=mock_broker))
+
+            # Broker reports 0 net quantity (flat/closed)
+            mock_broker.get_positions.return_value = [
+                {"security_id": "51011", "symbol": "RELIANCE26NOV2800CE", "net_qty": 0}
+            ]
+            self.assertFalse(run.is_script_open("RELIANCE", self.contract, broker=mock_broker))
+
+    def test_simulate_once_skips_script_already_in_open_position(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+        mock_broker.check_margin_available.return_value = (True, 25000.0, 50000.0)
+
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        pos_existing = Position("RELIANCE", "CALL", self.contract, 1, 1000, 100.0, 95.0, 95.0, 5.0, status="OPEN")
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            # Provide existing open position
+            positions = run.simulate_once(cfg, mock_broker, movers, picks, existing_positions=[pos_existing])
+
+            # Must NOT place another order
+            mock_broker.place_order.assert_not_called()
+            mock_broker.option_candles.assert_not_called()
+            # Existing position preserved
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0], pos_existing)
+
+    def test_10s_status_check_reports_open_position_and_syncs_broker(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+        mock_broker.get_order_list.return_value = [
+            {"order_id": "ORD99", "status": "EXECUTED", "average_price": 105.0}
+        ]
+        mock_broker.get_positions.return_value = [
+            {"security_id": "51011", "symbol": "RELIANCE26NOV2800CE", "net_qty": 250}
+        ]
+
+        pos = Position(
+            symbol="RELIANCE", direction="CALL", contract=self.contract, lots=1,
+            entry_ts=1000, entry=100.0, initial_stop=95.0, stop=95.0, risk=5.0,
+            status="OPEN", mode="live", order_id="ORD99", last_price=108.0
+        )
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [pos])
+            report = session.check_status_10s()
+
+            self.assertIn("RELIANCE", report)
+            self.assertIn("ORDER_EXECUTED", report["RELIANCE"]["trade_status"])
+            self.assertIn("OPEN", report["RELIANCE"]["position_status"])
+            self.assertEqual(pos.entry, 105.0)  # synced from broker order avg price
+
+    def test_10s_status_check_reports_waiting_breakout_when_no_position(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="paper")
+        mock_broker = mock.MagicMock()
+        movers = [{"symbol": "TCS", "direction": "CALL", "security_id": "11536", "close": 3500.0}]
+        picks = {"TCS": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [])
+            report = session.check_status_10s()
+
+            self.assertIn("TCS", report)
+            self.assertEqual(report["TCS"]["trade_status"], "WAITING_BREAKOUT")
+            self.assertEqual(report["TCS"]["position_status"], "NONE")
+
+    def test_30s_refresh_does_not_take_script_again_when_in_open_position(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+
+        pos = Position(
+            symbol="RELIANCE", direction="CALL", contract=self.contract, lots=1,
+            entry_ts=1000, entry=100.0, initial_stop=95.0, stop=95.0, risk=5.0,
+            status="OPEN", mode="live", order_id="ORD99", last_price=108.0
+        )
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [pos])
+            new_trades = session.refresh_30s()
+
+            # Script is in open position -> MUST NOT take that script again!
+            self.assertEqual(len(new_trades), 0)
+            mock_broker.place_order.assert_not_called()
+            mock_broker.option_candles.assert_not_called()
+            self.assertEqual(len(session.positions), 1)
+
+    def test_30s_refresh_takes_trade_when_new_confirmation_bar_arrives(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+        t0 = int(datetime(2026, 11, 9, 9, 15).timestamp())
+        t1 = int(datetime(2026, 11, 9, 9, 20).timestamp())
+        bars = [
+            Bar(t0, open=100.0, high=105.0, low=95.0, close=100.0, volume=1000),
+            Bar(t1, open=100.0, high=110.0, low=98.0, close=108.0, volume=2000),  # Breakout confirmation
+        ]
+        mock_broker.option_candles.return_value = bars
+        mock_broker.check_margin_available.return_value = (True, 27000.0, 50000.0)
+        mock_broker.place_order.return_value = {"order_id": "ORD101", "status": "PLACED"}
+        mock_broker.get_trade_list.return_value = [
+            {"order_id": "ORD101", "trade_id": "TRD101", "price": 108.0, "qty": 250, "action": "BUY", "symbol": "RELIANCE"}
+        ]
+
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            # Start session with NO open positions
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [])
+            self.assertEqual(len(session.positions), 0)
+
+            # 30-second refresh runs
+            new_trades = session.refresh_30s()
+
+            self.assertEqual(len(new_trades), 1)
+            self.assertEqual(len(session.positions), 1)
+            pos = session.positions[0]
+            self.assertEqual(pos.symbol, "RELIANCE")
+            self.assertEqual(pos.status, "OPEN")
+            self.assertEqual(pos.order_id, "ORD101")
+            mock_broker.place_order.assert_called_once()
+
+            # Second 30-second refresh runs: now that it is in OPEN position, MUST NOT take that script again!
+            mock_broker.place_order.reset_mock()
+            new_trades_second = session.refresh_30s()
+            self.assertEqual(len(new_trades_second), 0)
+            mock_broker.place_order.assert_not_called()
+            self.assertEqual(len(session.positions), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
