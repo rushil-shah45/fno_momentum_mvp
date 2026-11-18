@@ -145,12 +145,20 @@ class PositionOnTickTests(unittest.TestCase):
         self.assertFalse(closed)
         self.assertEqual(pos.status, "OPEN")
         self.assertEqual(pos.last_price, 95.0)
+        self.assertFalse(pos.trailing)
 
-        # Price ticks at or below stop
-        closed = pos.on_tick(89.5, 1020)
+        # Price ticks at or above entry + 1.0 (101.0) -> activates trailing stop
+        closed_trail = pos.on_tick(102.0, 1015)
+        self.assertFalse(closed_trail)
+        self.assertTrue(pos.trailing)
+        self.assertEqual(pos.stop, 101.0)  # max(90.0, 100.0 + 1.0)
+        self.assertEqual(pos.last_price, 102.0)
+
+        # Price ticks at or below stop (now 101.0)
+        closed = pos.on_tick(100.5, 1020)
         self.assertTrue(closed)
         self.assertEqual(pos.status, "EXIT_STOP")
-        self.assertEqual(pos.exit_price, 90.0)
+        self.assertEqual(pos.exit_price, 101.0)
         self.assertEqual(pos.exit_ts, 1020)
 
         # Further ticks do nothing

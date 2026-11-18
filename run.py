@@ -364,13 +364,21 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
 
 def trade_row(p: Position) -> dict:
     capital_used = round(p.entry * p.qty, 2)   # premium paid = entry price × qty
+    ltp = round(p.price_now, 2)
+    entry = round(p.entry, 2)
+    diff = round(ltp - entry, 2)
+    diff_pct = round((diff / entry * 100) if entry else 0.0, 2)
+    trail_sl = round(p.stop, 2)
     return {"symbol": p.symbol, "direction": p.direction, "option": p.contract.option_type,
             "strike": p.contract.strike, "expiry": p.contract.expiry.isoformat(),
             "lots": p.lots, "qty": p.qty, "capital_used": capital_used,
             "entry_time": fmt_time(p.entry_ts),
-            "entry": round(p.entry, 2), "initial_stop": round(p.initial_stop, 2),
-            "stop_now": round(p.stop, 2), "exit_time": fmt_time(p.exit_ts),
-            "exit_or_last": round(p.price_now, 2), "pnl": round(p.pnl, 2),
+            "entry": entry, "initial_stop": round(p.initial_stop, 2),
+            "stop_now": trail_sl, "trail_sl": trail_sl,
+            "exit_time": fmt_time(p.exit_ts),
+            "exit_or_last": ltp, "ltp": ltp,
+            "price_change": diff, "price_change_pct": diff_pct,
+            "pnl": round(p.pnl, 2),
             "r_multiple": round(p.r_multiple, 2), "trailing": p.trailing, "status": p.status,
             "mode": getattr(p, "mode", "paper"),
             "order_id": getattr(p, "order_id", ""),
@@ -420,7 +428,7 @@ class LiveTradeSession:
         self.picks = picks
         self.positions = initial_positions
         self.aggregator = CandleAggregator(interval_seconds=300)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.last_csv_write = 0.0
         self.last_tick_time = time.time()
         self.last_10s_check = 0.0
@@ -464,6 +472,8 @@ class LiveTradeSession:
 
             pos = self._get_position(sym)
             if pos and pos.status == "OPEN":
+                prev_stop = pos.stop
+                prev_trailing = pos.trailing
                 # Instant tick-level stop-loss check
                 closed = pos.on_tick(price, ts)
                 if closed:
@@ -489,6 +499,13 @@ class LiveTradeSession:
                     else:
                         print(f"\n[WS STOP] {pos.symbol} stop loss hit at {price:.2f} (Stop: {pos.stop:.2f})")
                     self._persist()
+                else:
+                    if not prev_trailing and pos.trailing:
+                        print(f"\n[TRAILING SL ACTIVATED] {pos.symbol} LTP Rs {price:.2f} >= entry + 1.0 -> TSL active (Stop: Rs {pos.stop:.2f})")
+                        self._persist()
+                    elif pos.trailing and pos.stop != prev_stop:
+                        print(f"\n[TRAILING SL] {pos.symbol} trailing stop ratcheted to Rs {pos.stop:.2f}")
+                        self._persist()
 
             # Aggregate tick into 5-minute candle
             completed_bar = self.aggregator.add_tick(sym, price, ts)
@@ -512,6 +529,14 @@ class LiveTradeSession:
                     elif pos.status == "OPEN" and pos.trailing and pos.stop != prev_stop:
                         print(f"\n[TRAILING SL] {pos.symbol} trailing stop ratcheted to Rs {pos.stop:.2f}")
                     self._persist()
+            else:
+                # In-progress candle: if trailing is active and candle low advances, ratchet stop
+                if pos and pos.status == "OPEN" and pos.trailing:
+                    curr_bar = self.aggregator.get_bar(sym)
+                    if curr_bar and (curr_bar.low - 1.0) > pos.stop:
+                        pos.stop = round(curr_bar.low - 1.0, 2)
+                        print(f"\n[TRAILING SL] {pos.symbol} trailing stop ratcheted to Rs {pos.stop:.2f}")
+                        self._persist()
 
             # Shared daily loss limit check
             if sum(p.pnl for p in self.positions) <= -self.cfg.max_daily_loss:
@@ -562,6 +587,9 @@ class LiveTradeSession:
 
         time_str = datetime.now(IST).strftime("%H:%M:%S")
         print(f"\n[10s STATUS CHECK] Checking trade & open position status ({time_str}):")
+
+        # Refresh latest broker quotes so LTP and trailing stop are up to date
+        self._poll_quotes()
 
         with self.lock:
             for m in self.movers:
@@ -617,11 +645,21 @@ class LiveTradeSession:
                                 position_status = "CLOSED_ON_BROKER"
 
                     if pos.status == "OPEN":
+                        diff = pos.last_price - pos.entry
+                        diff_pct = (diff / pos.entry * 100) if pos.entry else 0.0
+                        sign = "+" if diff > 0 else ""
+                        tsl_st = "TSL Active" if pos.trailing else "Fixed"
                         print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16} | "
-                              f"Entry: Rs {pos.entry:>7.2f} | LTP: Rs {pos.last_price:>7.2f} | Stop: Rs {pos.stop:>7.2f} | P&L: Rs {pos.pnl:>+8.2f}")
+                              f"Entry: Rs {pos.entry:>7.2f} | LTP: Rs {pos.last_price:>7.2f} ({sign}{diff:.2f}, {sign}{diff_pct:.1f}%) | "
+                              f"Trail SL: Rs {pos.stop:>7.2f} ({tsl_st}) | P&L: Rs {pos.pnl:>+8.2f}")
                     else:
+                        diff = (pos.exit_price or pos.last_price) - pos.entry
+                        diff_pct = (diff / pos.entry * 100) if pos.entry else 0.0
+                        sign = "+" if diff > 0 else ""
+                        tsl_st = "Trailed" if pos.trailing else "Fixed"
                         print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {pos.status:<16} | "
-                              f"Exit: Rs {pos.exit_price or pos.last_price:>7.2f} | P&L: Rs {pos.pnl:>+8.2f}")
+                              f"Exit: Rs {pos.exit_price or pos.last_price:>7.2f} ({sign}{diff:.2f}, {sign}{diff_pct:.1f}%) | "
+                              f"Trail SL: Rs {pos.stop:>7.2f} ({tsl_st}) | P&L: Rs {pos.pnl:>+8.2f}")
                 else:
                     # Check if broker shows an open position for it even without local pos
                     broker_has_pos = False

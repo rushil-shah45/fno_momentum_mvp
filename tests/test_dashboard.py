@@ -100,6 +100,28 @@ class RenderTests(unittest.TestCase):
         self.assertIn("Trailed", html)
         self.assertIn("Fixed", html)
 
+    def test_render_ltp_change_and_trail_sl_prices(self):
+        write_day(self.root, "2026-09-25", [
+            dict(symbol="RELIANCE", direction="CALL", option="CE", strike=1400.0, expiry="2026-09-29",
+                 lots=1, qty=100, capital_used=10000.0, entry_time="09:20:00", entry=100.0,
+                 initial_stop=90.0, stop_now=105.0, exit_time="", exit_or_last=110.0,
+                 pnl=1000.0, r_multiple=1.0, trailing=True, status="OPEN"),
+            dict(symbol="TCS", direction="PUT", option="PE", strike=3500.0, expiry="2026-09-29",
+                 lots=1, qty=50, capital_used=5000.0, entry_time="09:25:00", entry=100.0,
+                 initial_stop=110.0, stop_now=110.0, exit_time="10:00:00", exit_or_last=95.0,
+                 pnl=-250.0, r_multiple=-0.5, trailing=False, status="EXIT_STOP"),
+        ])
+        html = dashboard.render("2026-09-25")
+        self.assertIn("Trail SL ₹", html)
+        self.assertIn("LTP / Exit ₹", html)
+        self.assertIn("LTP Change", html)
+        # RELIANCE: entry 100, last 110 -> diff +10.00 (+10.0%), trailSL 105.00
+        self.assertIn("+10.00 (+10.0%)", html)
+        self.assertIn("105.00", html)
+        # TCS: entry 100, last 95 -> diff -5.00 (-5.0%), initial stop 110.00
+        self.assertIn("-5.00 (-5.0%)", html)
+        self.assertIn("110.00", html)
+
     def test_html_is_escaped(self):
         write_day(self.root, "2026-09-25", [trade("<script>alert(1)</script>", 10.0)])
         html = dashboard.render("2026-09-25")
@@ -120,7 +142,10 @@ class RenderTests(unittest.TestCase):
 
     def test_http_server(self):
         write_day(self.root, "2026-09-25", [trade("INFY", 77.0)])
-        server = dashboard.make_server(port=0)
+        try:
+            server = dashboard.make_server(port=0)
+        except (PermissionError, OSError) as e:
+            self.skipTest(f"Socket binding restricted: {e}")
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         try:
@@ -129,6 +154,10 @@ class RenderTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(f"{base}/secret")
             self.assertEqual(ctx.exception.code, 404)
+        except (urllib.error.URLError, PermissionError, OSError) as e:
+            if "Operation not permitted" in str(e):
+                self.skipTest(f"Socket networking restricted: {e}")
+            raise
         finally:
             server.shutdown()
             server.server_close()

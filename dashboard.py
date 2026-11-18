@@ -68,6 +68,15 @@ def load_trades(day: str) -> list[dict]:
             row["entry"] = float(row["entry"])
             row["exit_or_last"] = float(row["exit_or_last"])
             row["capital_used"] = float(row.get("capital_used") or 0)
+            row["initial_stop"] = float(row.get("initial_stop") or 0)
+            row["stop_now"] = float(row.get("stop_now") or 0)
+            row["trail_sl"] = float(row.get("trail_sl") or row["stop_now"])
+            row["ltp"] = float(row.get("ltp") or row["exit_or_last"])
+            entry = row["entry"]
+            ltp = row["ltp"]
+            diff = ltp - entry
+            row["price_change"] = float(row.get("price_change") or diff)
+            row["price_change_pct"] = float(row.get("price_change_pct") or ((diff / entry * 100) if entry else 0.0))
             trades.append(row)
         except (KeyError, ValueError, TypeError):
             continue                                     # skip a malformed row, keep the rest
@@ -254,24 +263,42 @@ def trade_table(trades: list[dict]) -> str:
     for t in sorted(trades, key=lambda x: (x.get("entry_time", ""), x.get("symbol", ""))):
         capital = t.get("capital_used", 0)
         capital_str = inr(float(capital)) if capital else "-"
+        entry = float(t.get("entry", 0.0))
+        last_px = float(t.get("ltp", t.get("exit_or_last", 0.0)))
+        diff = last_px - entry
+        diff_pct = (diff / entry * 100) if entry else 0.0
+        sign = "+" if diff > 0 else ""
+        diff_str = f"{sign}{diff:.2f} ({sign}{diff_pct:.1f}%)" if diff != 0 else "0.00 (0.0%)"
+
+        init_stop = float(t.get("initial_stop", 0.0))
+        stop_now = float(t.get("stop_now", 0.0))
+        trail_sl = float(t.get("trail_sl", stop_now))
+        is_trailing = str(t.get("trailing", "")).lower() in ("true", "1")
+
+        trail_sl_display = f"{trail_sl:.2f}" if is_trailing else f"{init_stop:.2f}"
+
         rows.append(
             f'<tr><td>{escape(t["symbol"])}</td>'
             f'<td class="l">{escape(t["direction"])}</td>'
             f'<td class="l">{escape(contract_label(t))}</td>'
             f'<td>{escape(str(t["lots"]))} / {escape(str(t["qty"]))}</td>'
             f'<td class="pos">{capital_str}</td>'
-            f'<td>{escape(t["entry_time"])}</td><td>{t["entry"]:.2f}</td>'
-            f'<td>{escape(str(t["initial_stop"]))} → {escape(str(t["stop_now"]))}</td>'
+            f'<td>{escape(t["entry_time"])}</td>'
+            f'<td>{entry:.2f}</td>'
+            f'<td>{init_stop:.2f}</td>'
+            f'<td><b>{trail_sl_display}</b></td>'
+            f'<td>{last_px:.2f}</td>'
+            f'<td class="{tone(diff)}"><b>{diff_str}</b></td>'
             f'<td>{escape(t["exit_time"] or "-")}</td>'
-            f'<td>{t["exit_or_last"]:.2f}</td>'
             f'<td class="{tone(t["pnl"])}"><b>{escape(inr(t["pnl"]))}</b></td>'
             f'<td class="{tone(t["r_multiple"])}">{t["r_multiple"]:+.2f}R</td>'
             f'<td>{trailing_tag(t)}</td>'
             f'<td>{status_tag(t)}</td></tr>')
     head = ("<tr><th>Stock</th><th class='l'>Side</th><th class='l'>Contract</th><th>Lots / Qty</th>"
             "<th>Capital Used</th>"
-            "<th>Entry time</th><th>Entry ₹</th><th>Stop (start → now)</th><th>Exit time</th>"
-            "<th>Exit / Last ₹</th><th>P&amp;L</th><th>R</th><th>Trailing</th><th>Status</th></tr>")
+            "<th>Entry time</th><th>Entry ₹</th><th>Initial Stop ₹</th><th>Trail SL ₹</th>"
+            "<th>LTP / Exit ₹</th><th>LTP Change</th><th>Exit time</th>"
+            "<th>P&amp;L</th><th>R</th><th>Trailing</th><th>Status</th></tr>")
     return f'<div class="wrap"><table>{head}{"".join(rows)}</table></div>'
 
 

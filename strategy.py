@@ -148,6 +148,7 @@ class Position:
     def on_tick(self, price: float, ts: int) -> bool:
         """Advance one tick. We always BUY options, so if a tick falls to or below
         the current stop, trigger an immediate exit.
+        Also activates trailing stop loss in real time when price moves >= 1 point above entry.
         Returns True if the position was closed on this tick.
         """
         if self.status != "OPEN":
@@ -156,6 +157,11 @@ class Position:
         if price <= self.stop:
             self.close(self.stop, ts, "EXIT_STOP")
             return True
+
+        # Activate 1-point trailing stop loss when price advances >= 1 point above entry
+        if not self.trailing and price >= self.entry + 1.0:
+            self.trailing = True
+            self.stop = max(self.stop, self.entry + 1.0)
         return False
 
     def on_bar(self, bar: Bar) -> None:
