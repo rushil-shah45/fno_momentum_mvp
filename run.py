@@ -24,7 +24,7 @@ from pathlib import Path
 from broker import (INDMoney, ICICIDirect, build_universe, get_broker, get_stream,
                     load_master, option_contracts)
 from settings import ROOT, Settings, load_settings
-from strategy import (IST, Bar, CandleAggregator, OpeningRange, Position, classify, fmt_time,
+from strategy import (ENTRY_CUTOFF_TIME, IST, Bar, CandleAggregator, OpeningRange, Position, classify, fmt_time,
                       open_position, pick_atm, rank_movers, run_session)
 
 DATA = ROOT / "data"
@@ -339,7 +339,8 @@ def is_script_traded_today(symbol: str, contract: Contract | None = None,
 
 
 def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
-                  existing_positions: list[Position] | None = None) -> list[Position]:
+                  existing_positions: list[Position] | None = None,
+                  now_time: time | None = None) -> list[Position]:
     positions = list(existing_positions) if existing_positions is not None else []
 
     # If no existing_positions was explicitly passed, load existing today's positions from trades.csv
@@ -369,6 +370,12 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
         if sym in traded_symbols or is_script_traded_today(sym, contract, positions, broker if is_live else None):
             print(f"[TRADE EXISTS TODAY] Script {sym} was already traded today (1 trade per stock per day rule). Skipping duplicate entry.")
             skipped.append((sym, "already traded today"))
+            continue
+
+        # Enforce 11:30 AM cutoff: no new trades can be initiated at or after 11:30 AM
+        if now_time is not None and now_time >= ENTRY_CUTOFF_TIME:
+            print(f"[TRADE CUTOFF] Current time ({now_time.strftime('%H:%M:%S')}) is at/after 11:30 AM cutoff. Skipping new trade for {sym}.")
+            skipped.append((sym, "after 11:30 AM trade cutoff"))
             continue
 
         bars = broker.option_candles(contract.security_id, today())
@@ -850,12 +857,19 @@ class LiveTradeSession:
             self._persist()
         return status_report
 
-    def refresh_30s(self) -> list[Position]:
+    def refresh_30s(self, now_time: time | None = None) -> list[Position]:
         """30-second refresh to check candidate scripts.
+        If current time is at or past 11:30 AM, no new trades will be taken.
         If the script is in open position, it will NOT take that script again.
         If not in open position, checks for confirmation breakout candle and enters if qualified.
         """
-        time_str = datetime.now(IST).strftime("%H:%M:%S")
+        now_time = now_time or getattr(self, "_time_override", None)
+        if now_time and now_time >= ENTRY_CUTOFF_TIME:
+            time_str = now_time.strftime("%H:%M:%S")
+            print(f"\n[30s REFRESH] 11:30 AM trade cutoff reached ({time_str}). No new trades will be taken today.")
+            return []
+
+        time_str = (now_time or datetime.now(IST).time()).strftime("%H:%M:%S")
         print(f"\n[30s REFRESH] Checking selected scripts (30s refresh cycle at {time_str})...")
         newly_opened = []
         is_live = (getattr(self.cfg, "trading_mode", "paper") == "live")
@@ -1001,10 +1015,11 @@ class LiveTradeSession:
                     self.last_10s_check = now
                     self.check_status_10s()
 
-                # Every 30 seconds: refresh candidate scripts (will not take open scripts again)
+                # Every 30 seconds: refresh candidate scripts (only until 11:30 AM cutoff)
                 if now - self.last_30s_refresh >= 30.0:
                     self.last_30s_refresh = now
-                    self.refresh_30s()
+                    if datetime.now(IST).time() < ENTRY_CUTOFF_TIME:
+                        self.refresh_30s()
 
                 # If no ticks received for 90s, poll quotes via REST
                 if time.time() - self.last_tick_time > 90:
@@ -1030,10 +1045,11 @@ class LiveTradeSession:
                 self.check_status_10s()
                 self._poll_quotes()
 
-            # Every 30 seconds: refresh candidate scripts (will not take open scripts again)
+            # Every 30 seconds: refresh candidate scripts (only until 11:30 AM cutoff)
             if now - self.last_30s_refresh >= 30.0:
                 self.last_30s_refresh = now
-                self.refresh_30s()
+                if datetime.now(IST).time() < ENTRY_CUTOFF_TIME:
+                    self.refresh_30s()
 
         return self._force_close_at_exit()
 
@@ -1065,8 +1081,12 @@ def cmd_trade(cfg: Settings, watch: bool) -> list[Position]:
         picks[m["symbol"]] = pick_atm(option_contracts(master, m["security_id"], kind, cfg),
                                       m["close"], datetime.now(IST).date(), cfg.min_days_to_expiry)
 
-    # Initial state computed from available historical candles
-    positions = simulate_once(cfg, broker, movers, picks)
+    now_t = datetime.now(IST).time()
+    if now_t >= ENTRY_CUTOFF_TIME:
+        print(f"[TRADE CUTOFF] Current time ({now_t.strftime('%H:%M:%S')}) is past 11:30 AM trade cutoff. No new trade entries will be taken.")
+
+    # Initial state computed from available historical candles (enforcing 11:30 AM cutoff for new entries)
+    positions = simulate_once(cfg, broker, movers, picks, now_time=now_t)
     if not watch or datetime.now(IST).time() >= cfg.force_exit:
         return positions
 

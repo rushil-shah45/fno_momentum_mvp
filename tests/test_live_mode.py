@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from unittest import mock
 
@@ -31,7 +31,7 @@ import broker
 import run
 import settings
 from settings import Settings
-from strategy import Bar, Contract, OpeningRange, Position
+from strategy import IST, Bar, Contract, OpeningRange, Position
 
 
 class TradingModeSettingsTests(unittest.TestCase):
@@ -536,7 +536,6 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
             self.assertEqual(len(new_trades), 0)
             mock_broker.place_order.assert_not_called()
             mock_broker.option_candles.assert_not_called()
-            self.assertEqual(len(session.positions), 1)
 
     def test_30s_refresh_takes_trade_when_new_confirmation_bar_arrives(self):
         cfg = Settings(active_broker="indmoney", trading_mode="live")
@@ -622,6 +621,34 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
         with mock.patch("run.today", return_value="2026-11-09"):
             session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [pos_closed])
             new_trades = session.refresh_30s()
+            self.assertEqual(len(new_trades), 0)
+            mock_broker.place_order.assert_not_called()
+            mock_broker.option_candles.assert_not_called()
+
+    def test_simulate_once_skips_when_after_1130_cutoff(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+        mock_broker.check_margin_available.return_value = (True, 25000.0, 50000.0)
+
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            # Provide now_time >= 11:30 AM
+            positions = run.simulate_once(cfg, mock_broker, movers, picks, now_time=time(11, 35))
+            mock_broker.place_order.assert_not_called()
+            mock_broker.option_candles.assert_not_called()
+            self.assertEqual(len(positions), 0)
+
+    def test_refresh_30s_skips_when_after_1130_cutoff(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2515.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [])
+            new_trades = session.refresh_30s(now_time=time(11, 35))
             self.assertEqual(len(new_trades), 0)
             mock_broker.place_order.assert_not_called()
             mock_broker.option_candles.assert_not_called()

@@ -14,6 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
 ENTRY_TIME = time(9, 20)       # v1.1: 5-min candle at 09:15 closes at 09:20
 TRADE_CUTOFF = time(11, 25)    # v1.1: last confirmation candle allowed (closes at 11:30)
+ENTRY_CUTOFF_TIME = time(11, 30)  # No new trades allowed at or after 11:30 AM IST
 
 
 # --------------------------------------------------------------------------- data
