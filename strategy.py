@@ -227,21 +227,76 @@ class CandleAggregator:
 
 
 def open_position(symbol: str, direction: str, contract: Contract, bars: list[Bar],
-                  max_risk: float, enforce_risk: bool
+                  max_risk: float, enforce_risk: bool,
+                  spot_bars: list[Bar] | None = None
                   ) -> tuple[Position | None, list[Bar], str]:
-    """Build the paper position from the option's candles.
+    """Build the paper position from option candles and optional spot candles.
 
     v1.1 logic (5-min timeframe, breakout/breakdown confirmation until 11:30):
-      - Opening bar  = the 09:15 5-min candle (timestamp 09:15, closes at 09:20).
-      - Confirmation = the first 5-min candle at or after 09:20 whose CLOSE breaks
-                       above the 09:15 high (CALL) or below the 09:15 low (PUT),
-                       and whose start time is <= TRADE_CUTOFF (11:25 IST, closes 11:30).
-      - Entry        = the close price of that confirmation candle.
-      - Stop         = the low of the 09:15 candle (CALL) or its high (PUT).
+      - When spot_bars are provided, 5m confirmation check evaluates on the SPOT chart:
+          * Opening bar  = the 09:15 5-min spot candle (timestamp 09:15, closes at 09:20).
+          * Confirmation = first 5-min spot candle at or after 09:20 whose CLOSE breaks
+                           above the 09:15 spot high (CALL) or below the 09:15 spot low (PUT),
+                           and whose start time is <= TRADE_CUTOFF (11:25 IST, closes 11:30).
+          * Entry        = close price of the option candle matching the spot confirmation candle.
+          * Stop         = low of the 09:15 option candle.
+      - When spot_bars are omitted (fallback/legacy):
+          * Breakout/breakdown is evaluated directly on option candles.
       - Lots         = always 1 (fixed).
 
     Returns (position or None, remaining bars after entry, skip_reason).
     """
+    if spot_bars:
+        spot_opening = [b for b in spot_bars if clock(b.ts) == MARKET_OPEN]
+        spot_window = [b for b in spot_bars if ENTRY_TIME <= clock(b.ts) <= TRADE_CUTOFF]
+        if not spot_opening:
+            return None, [], "no 09:15 candle available on spot"
+        if not spot_window:
+            return None, [], "no 5-min candles in confirmation window (09:20-11:30)"
+
+        spot_setup = spot_opening[0]
+        spot_setup_high = spot_setup.high
+        spot_setup_low = spot_setup.low
+
+        confirm_spot_bar: Bar | None = None
+        for b in spot_window:
+            if direction == "CALL" and b.close > spot_setup_high:
+                confirm_spot_bar = b
+                break
+            if direction == "PUT" and b.close < spot_setup_low:
+                confirm_spot_bar = b
+                break
+
+        if confirm_spot_bar is None:
+            return None, [], "no breakout/breakdown confirmation by 11:30"
+
+        # Match the option candle at the spot confirmation timestamp
+        matching_opt = [b for b in bars if b.ts == confirm_spot_bar.ts]
+        if not matching_opt:
+            candidates = [b for b in bars if b.ts >= confirm_spot_bar.ts]
+            if not candidates:
+                return None, [], "no matching option candle for spot confirmation"
+            confirm_opt_bar = candidates[0]
+        else:
+            confirm_opt_bar = matching_opt[0]
+
+        entry = confirm_opt_bar.close
+        opt_opening = [b for b in bars if clock(b.ts) == MARKET_OPEN]
+        opt_setup = opt_opening[0] if opt_opening else confirm_opt_bar
+        stop = opt_setup.low
+        if stop >= entry:
+            stop = round(min(opt_setup.low, confirm_opt_bar.low - 1.0, entry - 1.0), 2)
+        risk = abs(entry - stop)
+        if entry <= 0 or risk <= 0:
+            return None, [], "invalid entry or zero risk"
+
+        all_later = [b for b in bars if clock(b.ts) >= ENTRY_TIME]
+        rest = [b for b in all_later if b.ts > confirm_opt_bar.ts]
+        lots = 1
+        pos = Position(symbol, direction, contract, lots, confirm_spot_bar.ts, entry, stop, stop,
+                       risk, last_price=confirm_opt_bar.close)
+        return pos, rest, ""
+
     opening = [b for b in bars if clock(b.ts) == MARKET_OPEN]
     # Confirmation window: 09:20 up to and including 11:25 (that candle closes at 11:30)
     window = [b for b in bars if ENTRY_TIME <= clock(b.ts) <= TRADE_CUTOFF]

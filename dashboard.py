@@ -216,6 +216,9 @@ th:first-child,td:first-child,th.l,td.l{text-align:left}
 .line{stroke-width:2.2}.line.pos{stroke:var(--pos)}.line.neg{stroke:var(--neg)}.line.flat{stroke:var(--flat)}
 .dot{fill:var(--accent)}.bar.pos{fill:var(--pos)}.bar.neg{fill:var(--neg)}.bar.flat{fill:var(--flat)}
 .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+.active-card{border:1.5px solid var(--accent);background:var(--openbg);padding:14px 16px;border-radius:10px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+tr.row-open{background:var(--openbg)}
 footer{margin-top:32px;font-size:12px;color:var(--muted)}
 """
 
@@ -256,6 +259,54 @@ def trailing_tag(t: dict) -> str:
     return '<span class="tag flat">Fixed</span>'
 
 
+def active_trades_banner(trades: list[dict]) -> str:
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    if not open_trades:
+        return ""
+    cards = []
+    for t in open_trades:
+        sym = t.get("symbol", "")
+        opt_type = t.get("option", "")
+        strike = f"{float(t.get('strike', 0)):g}"
+        side = t.get("direction", "")
+        entry = float(t.get("entry", 0.0))
+        last_px = float(t.get("ltp", t.get("exit_or_last", 0.0)))
+        diff = last_px - entry
+        diff_pct = (diff / entry * 100) if entry else 0.0
+        sign = "+" if diff > 0 else ""
+        diff_str = f"{sign}{diff:.2f} ({sign}{diff_pct:.1f}%)" if diff != 0 else "0.00 (0.0%)"
+        pnl = float(t.get("pnl", 0.0))
+        r_mult = float(t.get("r_multiple", 0.0))
+
+        init_stop = float(t.get("initial_stop", 0.0))
+        stop_now = float(t.get("stop_now", 0.0))
+        trail_sl = float(t.get("trail_sl", stop_now))
+        is_trailing = str(t.get("trailing", "")).lower() in ("true", "1")
+
+        current_sl = trail_sl if is_trailing else init_stop
+        sl_status = '<span class="tag open">TSL active (Trailing)</span>' if is_trailing else '<span class="tag flat">Fixed Stop (Waiting +1.0 pt)</span>'
+
+        card_html = (
+            f'<div class="card active-card">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">'
+            f'  <span style="font-weight:700;font-size:15px;">{escape(sym)} {escape(strike)} {escape(opt_type)} ({escape(side)})</span>'
+            f'  <span class="badge" style="animation:pulse 2s infinite;">● ACTIVE POSITION</span>'
+            f'</div>'
+            f'<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;">'
+            f'  <div><div class="k">Entry Price</div><div class="v" style="font-size:18px;">₹{entry:.2f}</div><div class="s">{escape(t.get("entry_time", ""))}</div></div>'
+            f'  <div><div class="k">Latest Price (LTP)</div><div class="v {tone(diff)}" style="font-size:18px;">₹{last_px:.2f}</div>'
+            f'       <div class="s {tone(diff)}"><b>{escape(diff_str)}</b></div></div>'
+            f'  <div><div class="k">Trailing Stop (SL)</div><div class="v" style="font-size:18px;color:var(--accent);">₹{current_sl:.2f}</div>'
+            f'       <div class="s">{sl_status}</div></div>'
+            f'  <div><div class="k">Live P&amp;L</div><div class="v {tone(pnl)}" style="font-size:18px;">{escape(inr(pnl))}</div>'
+            f'       <div class="s {tone(r_mult)}">{r_mult:+.2f}R</div></div>'
+            f'</div>'
+            f'</div>'
+        )
+        cards.append(card_html)
+    return f'<h2>Active Positions (Live Tracker)</h2><div style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px;">{"".join(cards)}</div>'
+
+
 def trade_table(trades: list[dict]) -> str:
     if not trades:
         return '<p class="muted">No trades recorded for this day.</p>'
@@ -276,9 +327,11 @@ def trade_table(trades: list[dict]) -> str:
         is_trailing = str(t.get("trailing", "")).lower() in ("true", "1")
 
         trail_sl_display = f"{trail_sl:.2f}" if is_trailing else f"{init_stop:.2f}"
+        is_open = t.get("status") == "OPEN"
+        row_cls = ' class="row-open"' if is_open else ""
 
         rows.append(
-            f'<tr><td>{escape(t["symbol"])}</td>'
+            f'<tr{row_cls}><td>{escape(t["symbol"])}</td>'
             f'<td class="l">{escape(t["direction"])}</td>'
             f'<td class="l">{escape(contract_label(t))}</td>'
             f'<td>{escape(str(t["lots"]))} / {escape(str(t["qty"]))}</td>'
@@ -350,17 +403,22 @@ def render(requested_day: str | None = None) -> str:
     skipped = small_table(_read_rows(DATA / day / "skipped.csv"),
                           [("symbol", "Stock"), ("reason", "Why it was skipped")])
 
-    refresh = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if live else ""
+    has_open = any(t.get("status") == "OPEN" for t in trades)
+    refresh_seconds = 3 if has_open else 10 if live else REFRESH_SECONDS
+    refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if live else ""
     now = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
+    refresh_note = f" · auto-refresh every {refresh_seconds}s (live position active)" if (live and has_open) else (f" · auto-refresh every {refresh_seconds}s" if live else "")
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{refresh}
 <title>F&amp;O Momentum - Paper Dashboard</title><style>{CSS}</style></head><body><main>
 <header><h1>F&amp;O Momentum Dashboard <span class="badge">PAPER ONLY</span></h1>
-<span class="muted">Updated {escape(now)}{" · auto-refresh every %ds" % REFRESH_SECONDS if live else ""}</span></header>
+<span class="muted">Updated {escape(now)}{refresh_note}</span></header>
 <nav>{nav}</nav>
 
 <h2>{escape("Today" if live else day)} ({escape(day)})</h2>
 <div class="grid">{day_cards}</div>
+
+{active_trades_banner(trades)}
 
 <h2>Trades: entry and exit</h2>
 {trade_table(trades)}

@@ -122,6 +122,21 @@ class RenderTests(unittest.TestCase):
         self.assertIn("-5.00 (-5.0%)", html)
         self.assertIn("110.00", html)
 
+    def test_render_active_trade_banner_and_fast_refresh(self):
+        write_day(self.root, "2026-09-25", [
+            dict(symbol="RELIANCE", direction="CALL", option="CE", strike=1400.0, expiry="2026-09-29",
+                 lots=1, qty=100, capital_used=10000.0, entry_time="09:20:00", entry=100.0,
+                 initial_stop=90.0, stop_now=105.0, exit_time="", exit_or_last=112.5,
+                 pnl=1250.0, r_multiple=1.25, trailing=True, status="OPEN"),
+        ])
+        html = dashboard.render("2026-09-25")
+        self.assertIn("Active Positions (Live Tracker)", html)
+        self.assertIn("● ACTIVE POSITION", html)
+        self.assertIn("TSL active (Trailing)", html)
+        self.assertIn("₹112.50", html)
+        self.assertIn("₹105.00", html)
+        self.assertIn("row-open", html)
+
     def test_html_is_escaped(self):
         write_day(self.root, "2026-09-25", [trade("<script>alert(1)</script>", 10.0)])
         html = dashboard.render("2026-09-25")

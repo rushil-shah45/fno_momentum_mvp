@@ -262,8 +262,19 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
             continue
 
         bars = broker.option_candles(contract.security_id, today())
+        stock_sid = m.get("security_id", sym)
+        spot_bars = None
+        if hasattr(broker, "stock_candles"):
+            try:
+                res = broker.stock_candles(stock_sid, today())
+                if isinstance(res, list) and res and all(isinstance(b, Bar) for b in res):
+                    spot_bars = res
+            except Exception as e:
+                print(f"[SPOT CANDLES ERROR] Could not fetch spot candles for {sym}: {e}")
+
         pos, rest, why = open_position(sym, m["direction"], contract, bars,
-                                       cfg.max_risk_per_trade, cfg.enforce_risk_limit)
+                                       cfg.max_risk_per_trade, cfg.enforce_risk_limit,
+                                       spot_bars=spot_bars)
         if pos is None:
             skipped.append((sym, why))
             continue
@@ -553,9 +564,11 @@ class LiveTradeSession:
                                 print(f"\n[DAILY LOSS EXIT ERROR] Failed to close {p.symbol}: {e}")
                 self._persist()
 
-            # Periodically write trades.csv so dashboard reflects live tick P&L
+            # Periodically write trades.csv so dashboard reflects live tick P&L and trailing stops
             now = time.time()
-            if now - self.last_csv_write > 5.0:
+            has_open_pos = any(p.status == "OPEN" for p in self.positions)
+            persist_interval = 2.0 if has_open_pos else 5.0
+            if now - self.last_csv_write > persist_interval:
                 self._persist()
                 self.last_csv_write = now
 
@@ -718,9 +731,20 @@ class LiveTradeSession:
 
             # Script is not in open position and has not entered yet: check if breakout confirmation occurred
             try:
+                stock_sid = m.get("security_id", sym)
+                spot_bars = None
+                if hasattr(self.broker, "stock_candles"):
+                    try:
+                        res = self.broker.stock_candles(stock_sid, today())
+                        if isinstance(res, list) and res and all(isinstance(b, Bar) for b in res):
+                            spot_bars = res
+                    except Exception as e:
+                        print(f"  [SPOT CANDLES ERROR] Could not fetch spot candles for {sym}: {e}")
+
                 bars = self.broker.option_candles(contract.security_id, today())
                 new_pos, rest, why = open_position(sym, m["direction"], contract, bars,
-                                                   self.cfg.max_risk_per_trade, self.cfg.enforce_risk_limit)
+                                                   self.cfg.max_risk_per_trade, self.cfg.enforce_risk_limit,
+                                                   spot_bars=spot_bars)
                 if new_pos is None:
                     print(f"  [30s REFRESH] Script {sym}: {why}")
                     continue

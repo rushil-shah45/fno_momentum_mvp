@@ -256,6 +256,13 @@ class INDMoney:
         end_dt = datetime.combine(d, datetime.strptime("15:30:00", "%H:%M:%S").time(), tzinfo=IST)
         return self._candles(security_id, "5minute", start_dt, end_dt)
 
+    def stock_candles(self, security_id: str, day: str) -> list[Bar]:
+        """Fetch 5-min intraday stock bars for the underlying spot."""
+        d = datetime.strptime(day, "%Y-%m-%d").date()
+        start_dt = datetime.combine(d, datetime.strptime("09:15:00", "%H:%M:%S").time(), tzinfo=IST)
+        end_dt = datetime.combine(d, datetime.strptime("15:30:00", "%H:%M:%S").time(), tzinfo=IST)
+        return self._candles(security_id, "5minute", start_dt, end_dt)
+
     def stock_opening_range(self, security_id: str, day: str) -> OpeningRange:
         """Fetch the 09:15 5-min candle as the opening range (5m TF)."""
         d = datetime.strptime(day, "%Y-%m-%d").date()
@@ -566,6 +573,35 @@ class ICICIDirect:
             except Exception:
                 continue
         return bars
+
+    def stock_candles(self, security_id: str, day: str) -> list[Bar]:
+        """Fetch 5-min intraday stock bars for the underlying spot."""
+        res = self.breeze.get_historical_data_v2(
+            interval="5minute",
+            from_date=f"{day}T06:00:00.000Z",
+            to_date=f"{day}T15:30:00.000Z",
+            stock_code=security_id,
+            exchange_code="NSE",
+            product_type="cash",
+        )
+        if not isinstance(res, dict) or not res.get("Success"):
+            return []
+
+        bars = []
+        for c in res["Success"]:
+            try:
+                dt = datetime.strptime(c["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+                bars.append(Bar(
+                    ts=int(dt.timestamp()),
+                    open=float(c["open"]),
+                    high=float(c["high"]),
+                    low=float(c["low"]),
+                    close=float(c["close"]),
+                    volume=float(c.get("volume", 0.0)),
+                ))
+            except Exception:
+                continue
+        return sorted(bars, key=lambda b: b.ts)
 
     def stream(self, contracts: list[Contract], on_tick: Callable[[str, float, int], None]) -> ICICILiveStream:
         """Create and return an ICICI Direct Breeze WebSocket streaming client for the given contracts."""

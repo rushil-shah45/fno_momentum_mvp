@@ -264,6 +264,38 @@ class ICICIBrokerTests(unittest.TestCase):
                 self.assertEqual(bars[0].open, 45.0)
                 self.assertEqual(bars[0].close, 50.0)
 
+    def test_icici_stock_candles(self):
+        with mock.patch.object(auth, "get_access_token", return_value="tok"):
+            with mock.patch("breeze_connect.BreezeConnect") as mock_breeze_cls:
+                instance = mock_breeze_cls.return_value
+                instance.get_historical_data_v2.return_value = {
+                    "Status": 200,
+                    "Success": [
+                        {
+                            "datetime": "2026-10-23 09:15:00",
+                            "open": 2500.0,
+                            "high": 2520.0,
+                            "low": 2490.0,
+                            "close": 2515.0,
+                            "volume": 30000,
+                        },
+                        {
+                            "datetime": "2026-10-23 09:20:00",
+                            "open": 2515.0,
+                            "high": 2530.0,
+                            "low": 2510.0,
+                            "close": 2528.0,
+                            "volume": 40000,
+                        },
+                    ]
+                }
+                b = broker.ICICIDirect(ICICI_CFG)
+                bars = b.stock_candles("RELIND", "2026-10-23")
+                self.assertEqual(len(bars), 2)
+                self.assertIsInstance(bars[0], Bar)
+                self.assertEqual(bars[0].open, 2500.0)
+                self.assertEqual(bars[1].close, 2528.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -105,6 +105,40 @@ class PositionTests(unittest.TestCase):
         self.assertIsNone(pos)
         self.assertEqual(why, "no breakout/breakdown confirmation by 11:30")
 
+    def test_spot_breakout_call_entry_and_stop(self):
+        spot_bars = [bar("09:15", 2500, 2520, 2490, 2515),
+                     bar("09:20", 2515, 2525, 2510, 2522)]  # Breakout above 2520
+        opt_bars = [bar("09:15", 50, 55, 45, 52),
+                    bar("09:20", 52, 65, 50, 62),
+                    bar("09:25", 62, 68, 60, 66)]
+        pos, rest, why = open_position("RELIANCE", "CALL", CE, opt_bars, 5000, True, spot_bars=spot_bars)
+        self.assertIsNotNone(pos)
+        self.assertEqual(why, "")
+        self.assertEqual((pos.entry, pos.initial_stop), (62, 45))
+        self.assertEqual(pos.lots, 1)
+        self.assertEqual(len(rest), 1)
+
+    def test_spot_breakdown_put_entry_and_stop(self):
+        pe = Contract("2", "PE", date(2026, 9, 29), 100.0, 100)
+        spot_bars = [bar("09:15", 2500, 2510, 2480, 2485),
+                     bar("09:20", 2485, 2488, 2470, 2475)]  # Breakdown below 2480
+        opt_bars = [bar("09:15", 40, 55, 38, 50),
+                    bar("09:20", 50, 68, 49, 65)]
+        pos, rest, why = open_position("RELIANCE", "PUT", pe, opt_bars, 5000, True, spot_bars=spot_bars)
+        self.assertIsNotNone(pos)
+        self.assertEqual(why, "")
+        self.assertEqual((pos.entry, pos.initial_stop), (65, 38))
+        self.assertEqual(pos.lots, 1)
+
+    def test_spot_no_breakout_skips_even_if_option_moves(self):
+        spot_bars = [bar("09:15", 2500, 2520, 2490, 2515),
+                     bar("09:20", 2515, 2518, 2510, 2514)]  # Inside range, no breakout
+        opt_bars = [bar("09:15", 50, 55, 45, 52),
+                    bar("09:20", 52, 70, 50, 68)]  # Option moved but spot didn't
+        pos, _, why = open_position("RELIANCE", "CALL", CE, opt_bars, 5000, True, spot_bars=spot_bars)
+        self.assertIsNone(pos)
+        self.assertEqual(why, "no breakout/breakdown confirmation by 11:30")
+
     def test_stop_hit(self):
         pos, rest, _ = self.make([bar("09:25", 102, 103, 89, 90)])
         run_session([pos], {"X": rest}, 10**9, time(15, 0))
