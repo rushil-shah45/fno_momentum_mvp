@@ -531,6 +531,38 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
             mock_broker.place_order.assert_not_called()
             self.assertEqual(len(session.positions), 1)
 
+    def test_refresh_30s_with_spot_candles_confirmation(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="paper")
+        mock_broker = mock.MagicMock()
+        t0 = int(datetime(2026, 11, 9, 9, 15).timestamp())
+        t1 = int(datetime(2026, 11, 9, 9, 20).timestamp())
+
+        # Spot stock candles: 09:15 range (high=2520), 09:20 breakout close=2525
+        spot_bars = [
+            Bar(t0, open=2500.0, high=2520.0, low=2490.0, close=2515.0, volume=10000),
+            Bar(t1, open=2515.0, high=2530.0, low=2510.0, close=2525.0, volume=20000),
+        ]
+        mock_broker.stock_candles.return_value = spot_bars
+
+        # Option candles matching confirmation
+        opt_bars = [
+            Bar(t0, open=50.0, high=55.0, low=45.0, close=52.0, volume=1000),
+            Bar(t1, open=52.0, high=65.0, low=50.0, close=62.0, volume=2000),
+        ]
+        mock_broker.option_candles.return_value = opt_bars
+
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2515.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [])
+            new_trades = session.refresh_30s()
+            self.assertEqual(len(new_trades), 1)
+            pos = new_trades[0]
+            self.assertEqual(pos.symbol, "RELIANCE")
+            self.assertEqual(pos.entry, 62.0)
+            self.assertEqual(pos.initial_stop, 45.0)
+
 
 if __name__ == "__main__":
     unittest.main()

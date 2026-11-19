@@ -24,7 +24,7 @@ from pathlib import Path
 from broker import (INDMoney, ICICIDirect, build_universe, get_broker, get_stream,
                     load_master, option_contracts)
 from settings import ROOT, Settings, load_settings
-from strategy import (IST, CandleAggregator, OpeningRange, Position, classify, fmt_time,
+from strategy import (IST, Bar, CandleAggregator, OpeningRange, Position, classify, fmt_time,
                       open_position, pick_atm, rank_movers, run_session)
 
 DATA = ROOT / "data"
