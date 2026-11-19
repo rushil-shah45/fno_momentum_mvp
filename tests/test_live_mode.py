@@ -447,6 +447,14 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
             }])
             self.assertTrue(run.is_script_traded_today("INFY", self.contract))
 
+        mock_broker = mock.MagicMock()
+        mock_broker.get_positions.return_value = []
+        mock_broker.get_order_list.return_value = [
+            {"stock_code": "IDEA", "action": "BUY", "status": "REQUESTED"}
+        ]
+        self.assertTrue(run.is_script_traded_today("IDEA", self.contract, broker=mock_broker))
+        self.assertFalse(run.is_script_traded_today("SBIN", self.contract, broker=mock_broker))
+
     def test_simulate_once_skips_script_already_closed_today(self):
         cfg = Settings(active_broker="indmoney", trading_mode="live")
         mock_broker = mock.MagicMock()

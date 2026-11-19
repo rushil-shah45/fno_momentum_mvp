@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from strategy import (IST, Bar, Contract, OpeningRange, classify, open_position,
+from strategy import (IST, Bar, Contract, OpeningRange, Position, classify, open_position,
                       pick_atm, rank_movers, run_session)
 
 
@@ -174,6 +174,19 @@ class PositionTests(unittest.TestCase):
     def test_still_open(self):
         pos, rest, _ = self.make([bar("09:25", 102, 103, 101, 102.5)])
         run_session([pos], {"X": rest}, 10**9, time(15, 0))
+        self.assertEqual(pos.status, "OPEN")
+
+    def test_run_session_with_prior_positions_not_in_later(self):
+        # A previously closed position (e.g. INDHOTEL) loaded from trades.csv has no new bars in `later`
+        prior_pos = Position(
+            symbol="INDHOTEL", direction="CALL", contract=CE, lots=1,
+            entry_ts=1000, entry=500.0, initial_stop=490.0, stop=490.0, risk=10.0,
+            status="EXIT_STOP", exit_price=490.0
+        )
+        pos, rest, _ = self.make([bar("09:25", 102, 103, 101, 102.5)])
+        # Must not raise KeyError: 'INDHOTEL'
+        note = run_session([prior_pos, pos], {"X": rest}, 10**9, time(15, 0))
+        self.assertEqual(prior_pos.status, "EXIT_STOP")
         self.assertEqual(pos.status, "OPEN")
 
 

@@ -151,10 +151,23 @@ def load_existing_positions(day_str: str, picks: dict[str, Contract]) -> list[Po
             rows.sort(key=lambda r: 0 if r.get("status") == "OPEN" else 1)
             for r in rows:
                 sym = r.get("symbol")
-                if not sym or sym not in picks or sym in seen_symbols:
+                if not sym or sym in seen_symbols:
                     continue
                 seen_symbols.add(sym)
-                contract = picks[sym]
+                contract = picks.get(sym)
+                if not contract:
+                    try:
+                        exp_str = r.get("expiry") or today()
+                        exp_date = date.fromisoformat(exp_str) if "-" in exp_str else datetime.now(IST).date()
+                        contract = Contract(
+                            security_id=r.get("security_id", f"NFO_{sym}"),
+                            option_type=r.get("option", "CE"),
+                            expiry=exp_date,
+                            strike=float(r.get("strike") or 0.0),
+                            lot_size=int(float(r.get("qty") or 1)),
+                        )
+                    except Exception:
+                        continue
                 try:
                     lots = int(r.get("lots") or 1)
                     entry = float(r.get("entry") or 0.0)
@@ -230,10 +243,12 @@ def is_script_open(symbol: str, contract: Contract | None = None,
                     net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
                     if net_qty > 0:
                         matched = False
-                        if symbol and (symbol in sym or symbol in sec_id):
+                        if symbol and sym and (symbol in sym or sym in symbol):
                             matched = True
-                        elif contract and (contract.security_id in sec_id or sec_id in contract.security_id):
-                            if not sym or (symbol and symbol in sym):
+                        elif symbol and sec_id and symbol in sec_id:
+                            matched = True
+                        elif contract and sec_id and (contract.security_id in sec_id or sec_id in contract.security_id):
+                            if not sym or (symbol and (symbol in sym or sym in symbol)):
                                 matched = True
                         if matched:
                             return True
@@ -283,11 +298,38 @@ def is_script_traded_today(symbol: str, contract: Contract | None = None,
                     net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
                     if net_qty > 0:
                         matched = False
-                        if symbol and (symbol in sym or symbol in sec_id):
+                        if symbol and sym and (symbol in sym or sym in symbol):
                             matched = True
-                        elif contract and (contract.security_id in sec_id or sec_id in contract.security_id):
-                            if not sym or (symbol and symbol in sym):
+                        elif symbol and sec_id and symbol in sec_id:
+                            matched = True
+                        elif contract and sec_id and (contract.security_id in sec_id or sec_id in contract.security_id):
+                            if not sym or (symbol and (symbol in sym or sym in symbol)):
                                 matched = True
+                        if matched:
+                            return True
+        except Exception:
+            pass
+
+    # 4. Check broker's order list for today (prevents duplicate orders across scheduler restarts / crashes)
+    if broker and hasattr(broker, "get_order_list"):
+        try:
+            b_orders = broker.get_order_list(day_str)
+            if isinstance(b_orders, list):
+                for o in b_orders:
+                    if not isinstance(o, dict):
+                        continue
+                    action = str(o.get("action") or "").upper()
+                    st = str(o.get("status") or o.get("order_status") or "").upper()
+                    if action == "BUY" and st not in ("REJECTED", "CANCELLED"):
+                        o_sym = str(o.get("symbol") or o.get("trading_symbol") or o.get("tradingSymbol") or o.get("stock_code") or "")
+                        o_sec = str(o.get("security_id") or o.get("securityId") or o.get("scrip_code") or "")
+                        matched = False
+                        if symbol and o_sym and (symbol in o_sym or o_sym in symbol):
+                            matched = True
+                        elif symbol and o_sec and symbol in o_sec:
+                            matched = True
+                        elif contract and o_sec and (contract.security_id in o_sec or o_sec in contract.security_id):
+                            matched = True
                         if matched:
                             return True
         except Exception:
@@ -434,18 +476,32 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
         traded_symbols.add(pos.symbol)
         later[pos.symbol] = rest
 
-    note = run_session(positions, later, cfg.max_daily_loss, cfg.force_exit)
-    # Deduplicate positions by symbol before writing to trades.csv
-    deduped = []
-    seen = set()
-    for p in positions:
-        if p.symbol not in seen:
-            seen.add(p.symbol)
-            deduped.append(p)
-    positions = deduped
+        # Immediate persistence of trades.csv so any downstream error or interruption
+        # never causes a placed order to be forgotten and duplicated!
+        try:
+            write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in positions])
+        except Exception as persist_err:
+            log.warning("Could not persist trades.csv immediately: %s", persist_err)
 
-    write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in positions])
-    write_csv(DATA / today() / "skipped.csv", [{"symbol": s, "reason": w} for s, w in skipped])
+    note = ""
+    try:
+        note = run_session(positions, later, cfg.max_daily_loss, cfg.force_exit)
+    except Exception as e:
+        log.warning("run_session encountered error: %s", e)
+        note = f"session replay partial ({e})"
+    finally:
+        # Deduplicate positions by symbol before final write to trades.csv
+        deduped = []
+        seen = set()
+        for p in positions:
+            if p.symbol not in seen:
+                seen.add(p.symbol)
+                deduped.append(p)
+        positions = deduped
+
+        write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in positions])
+        write_csv(DATA / today() / "skipped.csv", [{"symbol": s, "reason": w} for s, w in skipped])
+
     print_report(positions, skipped, note, mode=cfg.trading_mode)
     return positions
 

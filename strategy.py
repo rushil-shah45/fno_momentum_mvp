@@ -356,9 +356,11 @@ def run_session(positions: list[Position], later: dict[str, list[Bar]],
             return "force-exit time reached"
 
         for p in positions:
-            bar = by_symbol[p.symbol].get(ts)
-            if bar:
-                p.on_bar(bar)
+            bars_for_p = by_symbol.get(p.symbol)
+            if bars_for_p:
+                bar = bars_for_p.get(ts)
+                if bar:
+                    p.on_bar(bar)
 
         if sum(p.pnl for p in positions) <= -max_daily_loss:   # realised + open
             for p in positions:
