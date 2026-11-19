@@ -137,17 +137,23 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
 
 # ------------------------------------------------------------------------ trade
 def load_existing_positions(day_str: str, picks: dict[str, Contract]) -> list[Position]:
-    """Load existing trades for the day from trades.csv to preserve open/closed positions."""
+    """Load existing trades for the day from trades.csv to preserve open/closed positions.
+    Deduplicates rows so only the latest/authoritative position per symbol is kept."""
     trades_path = DATA / day_str / "trades.csv"
     if not trades_path.exists():
         return []
     positions = []
+    seen_symbols = set()
     try:
         with trades_path.open(encoding="utf-8") as fh:
-            for r in csv.DictReader(fh):
+            rows = list(csv.DictReader(fh))
+            # Sort with OPEN first so if duplicate rows exist, OPEN takes precedence
+            rows.sort(key=lambda r: 0 if r.get("status") == "OPEN" else 1)
+            for r in rows:
                 sym = r.get("symbol")
-                if not sym or sym not in picks:
+                if not sym or sym not in picks or sym in seen_symbols:
                     continue
+                seen_symbols.add(sym)
                 contract = picks[sym]
                 try:
                     lots = int(r.get("lots") or 1)
@@ -237,28 +243,90 @@ def is_script_open(symbol: str, contract: Contract | None = None,
     return False
 
 
+def is_script_traded_today(symbol: str, contract: Contract | None = None,
+                           positions: list[Position] | None = None,
+                           broker = None, day_str: str | None = None) -> bool:
+    """Return True if the script was already traded today in ANY state (OPEN or CLOSED):
+    Guarantees the rule of exactly 1 trade per stock per day.
+    1. In-memory positions list (any status)
+    2. Today's trades.csv file (any status)
+    3. The broker's open portfolio/derivative positions (net_qty > 0)
+    """
+    # 1. Check in-memory positions list
+    if positions:
+        for p in positions:
+            if p.symbol == symbol:
+                return True
+
+    # 2. Check today's trades.csv file
+    day_str = day_str or today()
+    trades_path = DATA / day_str / "trades.csv"
+    if trades_path.exists():
+        try:
+            with trades_path.open(encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    if row.get("symbol") == symbol:
+                        return True
+        except Exception:
+            pass
+
+    # 3. Check broker's open positions
+    if broker and hasattr(broker, "get_positions"):
+        try:
+            b_positions = broker.get_positions()
+            if isinstance(b_positions, list):
+                for bp in b_positions:
+                    if not isinstance(bp, dict):
+                        continue
+                    sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
+                    sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
+                    net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
+                    if net_qty > 0:
+                        matched = False
+                        if symbol and (symbol in sym or symbol in sec_id):
+                            matched = True
+                        elif contract and (contract.security_id in sec_id or sec_id in contract.security_id):
+                            if not sym or (symbol and symbol in sym):
+                                matched = True
+                        if matched:
+                            return True
+        except Exception:
+            pass
+
+    return False
+
+
 def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
                   existing_positions: list[Position] | None = None) -> list[Position]:
     positions = list(existing_positions) if existing_positions is not None else []
-    existing_symbols = {p.symbol for p in positions if p.status == "OPEN"}
-    later, skipped = {}, []
-    is_live = (getattr(cfg, "trading_mode", "paper") == "live")
 
     # If no existing_positions was explicitly passed, load existing today's positions from trades.csv
     if existing_positions is None:
         for p in load_existing_positions(today(), picks):
-            positions.append(p)
-            if p.status == "OPEN":
-                existing_symbols.add(p.symbol)
+            if not any(ep.symbol == p.symbol for ep in positions):
+                positions.append(p)
+
+    # Deduplicate positions list by symbol
+    deduped = []
+    seen = set()
+    for p in positions:
+        if p.symbol not in seen:
+            seen.add(p.symbol)
+            deduped.append(p)
+    positions = deduped
+    traded_symbols = {p.symbol for p in positions}
+
+    later, skipped = {}, []
+    is_live = (getattr(cfg, "trading_mode", "paper") == "live")
 
     for m in movers:
         sym = m["symbol"]
         contract = picks[sym]
 
-        # Check if the script is in an open position
-        if sym in existing_symbols or is_script_open(sym, contract, positions, broker if is_live else None):
-            print(f"[OPEN POSITION EXISTS] Script {sym} is already in an OPEN position. Skipping new entry.")
-            skipped.append((sym, "already in open position"))
+        # Check if the script was already traded today (1 trade per stock per day rule)
+        if sym in traded_symbols or is_script_traded_today(sym, contract, positions, broker if is_live else None):
+            print(f"[TRADE EXISTS TODAY] Script {sym} was already traded today (1 trade per stock per day rule). Skipping duplicate entry.")
+            skipped.append((sym, "already traded today"))
             continue
 
         bars = broker.option_candles(contract.security_id, today())
@@ -363,10 +431,19 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
             pos.mode = "paper"
 
         positions.append(pos)
-        existing_symbols.add(pos.symbol)
+        traded_symbols.add(pos.symbol)
         later[pos.symbol] = rest
 
     note = run_session(positions, later, cfg.max_daily_loss, cfg.force_exit)
+    # Deduplicate positions by symbol before writing to trades.csv
+    deduped = []
+    seen = set()
+    for p in positions:
+        if p.symbol not in seen:
+            seen.add(p.symbol)
+            deduped.append(p)
+    positions = deduped
+
     write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in positions])
     write_csv(DATA / today() / "skipped.csv", [{"symbol": s, "reason": w} for s, w in skipped])
     print_report(positions, skipped, note, mode=cfg.trading_mode)
@@ -437,7 +514,14 @@ class LiveTradeSession:
         self.broker = broker
         self.movers = movers
         self.picks = picks
-        self.positions = initial_positions
+        # Deduplicate initial_positions by symbol
+        deduped = []
+        seen = set()
+        for p in initial_positions:
+            if p.symbol not in seen:
+                seen.add(p.symbol)
+                deduped.append(p)
+        self.positions = deduped
         self.aggregator = CandleAggregator(interval_seconds=300)
         self.lock = threading.RLock()
         self.last_csv_write = 0.0
@@ -467,6 +551,14 @@ class LiveTradeSession:
         return None
 
     def _persist(self) -> None:
+        # Deduplicate positions by symbol before writing
+        seen = set()
+        deduped = []
+        for p in self.positions:
+            if p.symbol not in seen:
+                seen.add(p.symbol)
+                deduped.append(p)
+        self.positions = deduped
         write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in self.positions])
 
     def on_tick(self, sec_id: str, price: float, ts: int) -> None:
@@ -719,14 +811,11 @@ class LiveTradeSession:
                 continue
 
             pos = self._get_position(sym)
-            # CRITICAL: If the script is in open position, it will not take that script again even after 30s refreshed
-            if (pos and pos.status == "OPEN") or is_script_open(sym, contract, self.positions, self.broker if is_live else None):
-                print(f"  [30s REFRESH] Script {sym} is in OPEN position -> will not take that script again.")
-                continue
-
-            # If position was already taken and closed today, do not re-enter on old signal
-            if pos and pos.status != "OPEN":
-                print(f"  [30s REFRESH] Script {sym} was already traded today (Status: {pos.status}). Skipping.")
+            # CRITICAL: 1 trade per stock per day rule.
+            # If the script was already traded today (in self.positions, trades.csv, or on broker), do NOT trade again.
+            if pos is not None or is_script_traded_today(sym, contract, self.positions, self.broker if is_live else None):
+                status_str = pos.status if pos else "TRADED_OR_OPEN"
+                print(f"  [30s REFRESH] Script {sym} was already traded today (Status: {status_str}) -> will not take that script again.")
                 continue
 
             # Script is not in open position and has not entered yet: check if breakout confirmation occurred
@@ -789,6 +878,9 @@ class LiveTradeSession:
                     new_pos.mode = "paper"
 
                 with self.lock:
+                    if any(p.symbol == sym for p in self.positions):
+                        print(f"  [30s REFRESH] Race condition detected: {sym} already in positions. Skipping duplicate.")
+                        continue
                     self.positions.append(new_pos)
                 newly_opened.append(new_pos)
                 self._persist()

@@ -61,7 +61,24 @@ def _read_rows(path) -> list[dict]:
 
 def load_trades(day: str) -> list[dict]:
     trades = []
-    for row in _read_rows(DATA / day / "trades.csv"):
+    rows = _read_rows(DATA / day / "trades.csv")
+    if not rows:
+        return []
+
+    # Deduplicate rows by symbol so duplicates never appear on dashboard
+    by_symbol: dict[str, list[dict]] = {}
+    for row in rows:
+        sym = row.get("symbol")
+        if not sym:
+            continue
+        by_symbol.setdefault(sym, []).append(row)
+
+    deduped_rows = []
+    for sym, sym_rows in by_symbol.items():
+        open_row = next((r for r in sym_rows if r.get("status") == "OPEN"), None)
+        deduped_rows.append(open_row or sym_rows[-1])
+
+    for row in deduped_rows:
         try:
             row["pnl"] = float(row["pnl"])
             row["r_multiple"] = float(row["r_multiple"])
@@ -404,7 +421,7 @@ def render(requested_day: str | None = None) -> str:
                           [("symbol", "Stock"), ("reason", "Why it was skipped")])
 
     has_open = any(t.get("status") == "OPEN" for t in trades)
-    refresh_seconds = 3 if has_open else 10 if live else REFRESH_SECONDS
+    refresh_seconds = 5 if has_open else 10 if live else REFRESH_SECONDS
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if live else ""
     now = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
     refresh_note = f" · auto-refresh every {refresh_seconds}s (live position active)" if (live and has_open) else (f" · auto-refresh every {refresh_seconds}s" if live else "")

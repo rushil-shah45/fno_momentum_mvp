@@ -426,6 +426,47 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
             self.assertEqual(len(positions), 1)
             self.assertEqual(positions[0], pos_existing)
 
+    def test_is_script_traded_today_detects_open_and_closed_states(self):
+        day = "2026-11-09"
+        trades_dir = Path(self.tmp.name) / day
+        trades_dir.mkdir(parents=True, exist_ok=True)
+        trades_file = trades_dir / "trades.csv"
+
+        pos_closed = Position("TCS", "CALL", self.contract, 1, 1000, 100.0, 95.0, 95.0, 5.0, status="EXIT_STOP")
+        self.assertTrue(run.is_script_traded_today("TCS", self.contract, positions=[pos_closed]))
+        self.assertFalse(run.is_script_traded_today("INFY", self.contract, positions=[pos_closed]))
+
+        with mock.patch("run.today", return_value=day):
+            run.write_csv(trades_file, [{
+                "symbol": "INFY", "direction": "CALL", "option": "CE", "strike": 1800.0,
+                "expiry": "2026-11-26", "lots": 1, "qty": 400, "capital_used": 16000.0,
+                "entry_time": "09:20:00", "entry": 40.0, "initial_stop": 35.0, "stop_now": 35.0,
+                "exit_time": "09:45:00", "exit_or_last": 35.0, "pnl": -2000.0, "r_multiple": -1.0,
+                "trailing": "False", "status": "EXIT_STOP", "mode": "paper", "order_id": "",
+                "exit_order_id": ""
+            }])
+            self.assertTrue(run.is_script_traded_today("INFY", self.contract))
+
+    def test_simulate_once_skips_script_already_closed_today(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="live")
+        mock_broker = mock.MagicMock()
+        mock_broker.check_margin_available.return_value = (True, 25000.0, 50000.0)
+
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        # Previously traded and stopped out earlier today
+        pos_stopped = Position("RELIANCE", "CALL", self.contract, 1, 1000, 100.0, 95.0, 95.0, 5.0, status="EXIT_STOP")
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            positions = run.simulate_once(cfg, mock_broker, movers, picks, existing_positions=[pos_stopped])
+
+            # Must NOT re-trade or place duplicate order
+            mock_broker.place_order.assert_not_called()
+            mock_broker.option_candles.assert_not_called()
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0].status, "EXIT_STOP")
+
     def test_10s_status_check_reports_open_position_and_syncs_broker(self):
         cfg = Settings(active_broker="indmoney", trading_mode="live")
         mock_broker = mock.MagicMock()
@@ -562,6 +603,20 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
             self.assertEqual(pos.symbol, "RELIANCE")
             self.assertEqual(pos.entry, 62.0)
             self.assertEqual(pos.initial_stop, 45.0)
+
+    def test_refresh_30s_skips_script_already_closed_today(self):
+        cfg = Settings(active_broker="indmoney", trading_mode="paper")
+        mock_broker = mock.MagicMock()
+        pos_closed = Position("RELIANCE", "CALL", self.contract, 1, 1000, 100.0, 95.0, 95.0, 5.0, status="EXIT_STOP")
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2515.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, [pos_closed])
+            new_trades = session.refresh_30s()
+            self.assertEqual(len(new_trades), 0)
+            mock_broker.place_order.assert_not_called()
+            mock_broker.option_candles.assert_not_called()
 
 
 if __name__ == "__main__":

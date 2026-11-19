@@ -151,6 +151,22 @@ class RenderTests(unittest.TestCase):
         write_day(self.root, "2026-09-25", [trade("OK", 5.0), dict(trade("BAD", 1.0), pnl="oops")])
         self.assertEqual([t["symbol"] for t in dashboard.load_trades("2026-09-25")], ["OK"])
 
+    def test_load_trades_deduplicates_by_symbol(self):
+        # Multiple rows for RELIANCE (one EXIT_STOP, one OPEN)
+        write_day(self.root, "2026-09-25", [
+            trade("RELIANCE", -500.0, status="EXIT_STOP"),
+            trade("RELIANCE", 1000.0, status="OPEN"),
+            trade("TCS", 200.0, status="EXIT_STOP"),
+            trade("TCS", 300.0, status="EXIT_STOP"),
+        ])
+        trades = dashboard.load_trades("2026-09-25")
+        self.assertEqual(len(trades), 2)
+        symbols = {t["symbol"] for t in trades}
+        self.assertEqual(symbols, {"RELIANCE", "TCS"})
+        rel = next(t for t in trades if t["symbol"] == "RELIANCE")
+        # Should prefer OPEN
+        self.assertEqual(rel["status"], "OPEN")
+
     def test_bad_date_param_is_ignored(self):
         html = dashboard.render("../../etc/passwd")
         self.assertNotIn("passwd", html)
