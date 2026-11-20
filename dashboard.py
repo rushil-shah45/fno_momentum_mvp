@@ -311,6 +311,8 @@ WS_SCRIPT = """<script>
             return;
         }
         ws.onopen = function() {
+            const meta = document.querySelector('meta[http-equiv="refresh"]');
+            if (meta) meta.remove();
             const badge = document.getElementById('ws-badge');
             if (badge) {
                 badge.style.display = 'inline-block';
@@ -346,19 +348,12 @@ WS_SCRIPT = """<script>
     }
     connect();
 
-    // Polling fallback: If no WebSocket message arrived for 2s, poll /api/trades every 1.5s
+    // Polling fallback: If no WebSocket message arrived for 2s, poll /api/trades every 1.5s (updates DOM seamlessly without reloading page)
     setInterval(function() {
         if (!ws || ws.readyState !== WebSocket.OPEN || (Date.now() - lastUpdateTs > 2000)) {
             pollFallback();
         }
     }, 1500);
-
-    // Watchdog fallback: If no update succeeded for 5.5s, refresh the entire page automatically
-    setInterval(function() {
-        if (Date.now() - lastUpdateTs > 5500) {
-            location.reload();
-        }
-    }, 1000);
 })();
 </script>"""
 
@@ -666,10 +661,9 @@ def render(requested_day: str | None = None) -> str:
     skipped = small_table(_read_rows(DATA / day / "skipped.csv"),
                           [("symbol", "Stock"), ("reason", "Why it was skipped")])
 
-    refresh_seconds = 5 if has_open else 10 if live else REFRESH_SECONDS
-    refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if live else ""
+    refresh = ""
     now = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
-    refresh_note = f" · auto-refresh every {refresh_seconds}s (live position active)" if (live and has_open) else (f" · auto-refresh every {refresh_seconds}s" if live else "")
+    refresh_note = " · WebSocket live streaming" if live else ""
     ws_script = WS_SCRIPT if live else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{refresh}
