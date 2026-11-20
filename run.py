@@ -816,6 +816,10 @@ class LiveTradeSession:
                             net_qty = float(b_match.get("net_qty") or b_match.get("netQty") or b_match.get("net_quantity") or b_match.get("quantity") or b_match.get("qty") or 0.0)
                             if net_qty > 0:
                                 position_status = f"OPEN (Broker Qty: {int(net_qty)})"
+                                bp_px = float(b_match.get("ltp") or b_match.get("last_price") or b_match.get("current_price") or b_match.get("market_price") or 0.0)
+                                if bp_px > 0 and pos.status == "OPEN":
+                                    pos.last_price = bp_px
+                                    pos.on_tick(bp_px, now_ts)
                             elif net_qty == 0 and pos.status == "OPEN":
                                 pos.close(pos.last_price, now_ts, "EXIT_EXTERNAL")
                                 position_status = "CLOSED_ON_BROKER"

@@ -471,7 +471,22 @@ class ICICIDirect:
 
         def fetch_one(sid: str):
             try:
-                res = self.breeze.get_quotes(stock_code=sid, exchange_code="NSE")
+                if ":" in str(sid):
+                    parts = str(sid).split(":")
+                    if len(parts) >= 5:
+                        token, stock_code, expiry_str, strike_str, opt_type = parts[:5]
+                        res = self.breeze.get_quotes(
+                            stock_code=stock_code,
+                            exchange_code="NFO",
+                            product_type="options",
+                            expiry_date=expiry_str,
+                            strike_price=str(strike_str),
+                            right="call" if opt_type.upper() == "CE" else "put",
+                        )
+                    else:
+                        res = self.breeze.get_quotes(stock_code=sid, exchange_code="NSE")
+                else:
+                    res = self.breeze.get_quotes(stock_code=sid, exchange_code="NSE")
                 if isinstance(res, dict) and res.get("Success"):
                     items = res["Success"] if isinstance(res["Success"], list) else [res["Success"]]
                     if items:
