@@ -1028,8 +1028,11 @@ class ICICILiveStream:
             parts = c.security_id.split(":")
             if len(parts) >= 5:
                 tok = parts[0]
+                stock_code = parts[1]
                 self._token_map[tok] = c.security_id
                 self._token_map[f"4.1!{tok}"] = c.security_id
+                self._token_map[f"4.2!{tok}"] = c.security_id
+                self._token_map[stock_code] = c.security_id
             self._token_map[c.security_id] = c.security_id
 
     def _on_ticks_handler(self, data):
@@ -1044,10 +1047,17 @@ class ICICILiveStream:
             return
 
         now_ts = int(time.time())
-        sym = str(data.get("symbol") or data.get("stock_name") or data.get("stock_code") or "")
-        sec_id = self._token_map.get(sym) or sym
-        if not sec_id and self.contracts:
-            sec_id = self.contracts[0].security_id
+        sym = str(data.get("token") or data.get("symbol") or data.get("stock_name") or data.get("stock_code") or "")
+        sec_id = self._token_map.get(sym)
+        if not sec_id and "!" in sym:
+            clean_tok = sym.split("!")[-1]
+            sec_id = self._token_map.get(clean_tok)
+        if not sec_id:
+            sec_id = sym if sym in self._token_map else None
+
+        # Never misattribute ticks to contracts[0] if sec_id cannot be verified
+        if not sec_id:
+            return
 
         if self.on_tick:
             try:

@@ -311,8 +311,6 @@ WS_SCRIPT = """<script>
             return;
         }
         ws.onopen = function() {
-            const meta = document.querySelector('meta[http-equiv="refresh"]');
-            if (meta) meta.remove();
             const badge = document.getElementById('ws-badge');
             if (badge) {
                 badge.style.display = 'inline-block';
@@ -348,12 +346,19 @@ WS_SCRIPT = """<script>
     }
     connect();
 
-    // Fallback: poll every 1.5s if WS is down or inactive
+    // Polling fallback: If no WebSocket message arrived for 2s, poll /api/trades every 1.5s
     setInterval(function() {
-        if (!ws || ws.readyState !== WebSocket.OPEN || (Date.now() - lastUpdateTs > 3000)) {
+        if (!ws || ws.readyState !== WebSocket.OPEN || (Date.now() - lastUpdateTs > 2000)) {
             pollFallback();
         }
     }, 1500);
+
+    // Watchdog fallback: If no update succeeded for 5.5s, refresh the entire page automatically
+    setInterval(function() {
+        if (Date.now() - lastUpdateTs > 5500) {
+            location.reload();
+        }
+    }, 1000);
 })();
 </script>"""
 
@@ -574,8 +579,12 @@ def get_trade_update_payload(target_day: str) -> dict:
 def broadcast_trade_update(day: str | None = None) -> None:
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
     target_day = day or today_str
-    payload = get_trade_update_payload(target_day)
-    frame = make_ws_frame(json.dumps(payload))
+    try:
+        payload = get_trade_update_payload(target_day)
+        frame = make_ws_frame(json.dumps(payload))
+    except Exception:
+        return
+
     with _CLIENTS_LOCK:
         dead = []
         for sock, client_day in list(_WS_CLIENTS.items()):
@@ -590,21 +599,30 @@ def broadcast_trade_update(day: str | None = None) -> None:
 
 def _trade_watcher():
     last_mtimes: dict[str, float] = {}
+    last_broadcast_ts: float = 0.0
     while True:
-        time.sleep(0.5)
-        today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        with _CLIENTS_LOCK:
-            days_to_check = set(_WS_CLIENTS.values()) | {today_str}
-        for d in days_to_check:
-            trades_file = DATA / d / "trades.csv"
-            try:
+        try:
+            time.sleep(0.5)
+            now = time.time()
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            with _CLIENTS_LOCK:
+                days_to_check = set(_WS_CLIENTS.values()) | {today_str}
+                has_clients = bool(_WS_CLIENTS)
+
+            force_periodic = (has_clients and (now - last_broadcast_ts >= 1.5))
+            for d in days_to_check:
+                trades_file = DATA / d / "trades.csv"
                 if trades_file.exists():
-                    mtime = trades_file.stat().st_mtime
-                    if mtime != last_mtimes.get(d, 0.0):
-                        last_mtimes[d] = mtime
-                        broadcast_trade_update(d)
-            except Exception:
-                pass
+                    try:
+                        mtime = trades_file.stat().st_mtime
+                        if mtime != last_mtimes.get(d, 0.0) or force_periodic:
+                            last_mtimes[d] = mtime
+                            broadcast_trade_update(d)
+                            last_broadcast_ts = now
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 def start_watcher():

@@ -808,7 +808,7 @@ class LiveTradeSession:
                         for bp in broker_positions:
                             sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
                             b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
-                            if sym in b_sym or (contract.security_id in sec_id or sec_id in contract.security_id):
+                            if (sym in b_sym or b_sym in sym) or (contract.security_id in sec_id or sec_id in contract.security_id):
                                 b_match = bp
                                 break
 
@@ -848,7 +848,7 @@ class LiveTradeSession:
                             sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
                             b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
                             net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
-                            if net_qty > 0 and (sym in b_sym or (contract.security_id in sec_id or sec_id in contract.security_id)):
+                            if net_qty > 0 and ((sym in b_sym or b_sym in sym) or (contract.security_id in sec_id or sec_id in contract.security_id)):
                                 broker_has_pos = True
                                 break
                     if broker_has_pos:
@@ -1033,8 +1033,10 @@ class LiveTradeSession:
                     if datetime.now(IST).time() < ENTRY_CUTOFF_TIME:
                         self.refresh_30s()
 
-                # If no ticks received for 10s, poll quotes via REST
-                if time.time() - self.last_tick_time > 10:
+                # Poll quotes via REST to keep LTP & trailing stop updated
+                has_open_pos = any(p.status == "OPEN" for p in self.positions)
+                max_tick_silence = 2.0 if has_open_pos else 10.0
+                if time.time() - self.last_tick_time > max_tick_silence:
                     self.last_tick_time = time.time()
                     self._poll_quotes()
         finally:
@@ -1046,10 +1048,18 @@ class LiveTradeSession:
     def _fallback_polling(self) -> list[Position]:
         self.last_10s_check = time.time()
         self.last_30s_refresh = time.time()
+        self.last_fast_poll = 0.0
 
         while datetime.now(IST).time() < self.cfg.force_exit:
             time.sleep(1)
             now = time.time()
+
+            # Fast quote poll every 2s for open positions to keep LTP / trailing stops live
+            has_open_pos = any(p.status == "OPEN" for p in self.positions)
+            poll_interval = 2.0 if has_open_pos else 10.0
+            if now - self.last_fast_poll >= poll_interval:
+                self.last_fast_poll = now
+                self._poll_quotes()
 
             # Every 10 seconds: check status and update quotes
             if now - self.last_10s_check >= 10.0:
