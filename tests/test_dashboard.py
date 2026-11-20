@@ -217,6 +217,19 @@ class RenderTests(unittest.TestCase):
             with dashboard._CLIENTS_LOCK:
                 dashboard._WS_CLIENTS.pop(mock_socket, None)
 
+    def test_get_trade_update_payload_structure(self):
+        write_day(self.root, "2026-09-25", [trade("RELIANCE", 1500.0, status="OPEN")])
+        payload = dashboard.get_trade_update_payload("2026-09-25")
+        self.assertEqual(payload["type"], "trade_update")
+        self.assertEqual(payload["day"], "2026-09-25")
+        self.assertEqual(len(payload["trades"]), 1)
+        self.assertEqual(payload["trades"][0]["symbol"], "RELIANCE")
+        self.assertIn("html", payload)
+        self.assertIn("active_banner", payload["html"])
+        self.assertIn("trade_table", payload["html"])
+        self.assertIn("day_cards", payload["html"])
+        self.assertEqual(dashboard.Handler.protocol_version, "HTTP/1.1")
+
     def test_http_server(self):
         write_day(self.root, "2026-09-25", [trade("INFY", 77.0)])
         try:

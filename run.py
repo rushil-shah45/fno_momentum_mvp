@@ -602,7 +602,10 @@ class LiveTradeSession:
             self.sec_id_to_symbol[sid.replace(":", "_")] = sym
             self.sec_id_to_symbol[sid.replace("_", ":")] = sym
             if ":" in sid:
-                self.sec_id_to_symbol[sid.split(":")[0]] = sym
+                tok = sid.split(":")[0]
+                self.sec_id_to_symbol[tok] = sym
+                self.sec_id_to_symbol[f"4.1!{tok}"] = sym
+                self.sec_id_to_symbol[f"4.2!{tok}"] = sym
                 self.sec_id_to_symbol[sid.split(":")[-1]] = sym
             if "_" in sid:
                 self.sec_id_to_symbol[sid.split("_")[-1]] = sym
@@ -1026,8 +1029,8 @@ class LiveTradeSession:
                     if datetime.now(IST).time() < ENTRY_CUTOFF_TIME:
                         self.refresh_30s()
 
-                # If no ticks received for 90s, poll quotes via REST
-                if time.time() - self.last_tick_time > 90:
+                # If no ticks received for 10s, poll quotes via REST
+                if time.time() - self.last_tick_time > 10:
                     self.last_tick_time = time.time()
                     self._poll_quotes()
         finally:

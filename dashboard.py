@@ -255,6 +255,53 @@ WS_SCRIPT = """<script>
 (function() {
     let ws = null;
     let timer = null;
+    let lastUpdateTs = Date.now();
+
+    function updateDOM(data) {
+        if (!data) return;
+        lastUpdateTs = Date.now();
+        if (data.html) {
+            if (data.html.active_banner !== undefined) {
+                const banner = document.getElementById('active-trades-container');
+                if (banner) banner.innerHTML = data.html.active_banner;
+            }
+            if (data.html.trade_table !== undefined) {
+                const table = document.getElementById('trades-table-container');
+                if (table) table.innerHTML = data.html.trade_table;
+            }
+            if (data.html.day_cards !== undefined) {
+                const cards = document.getElementById('day-cards-container');
+                if (cards) cards.innerHTML = data.html.day_cards;
+            }
+            if (data.html.pnl_chart !== undefined) {
+                const chart = document.getElementById('pnl-chart-container');
+                if (chart) chart.innerHTML = '<h2>P&amp;L per trade</h2>' + data.html.pnl_chart;
+            }
+            if (data.updated_at) {
+                const timeEl = document.getElementById('updated-time-text');
+                if (timeEl) timeEl.textContent = 'Updated ' + data.updated_at;
+            }
+        }
+    }
+
+    function pollFallback() {
+        const url = '/api/trades' + location.search;
+        fetch(url, {cache: 'no-store'})
+            .then(res => res.json())
+            .then(data => {
+                updateDOM(data);
+                const badge = document.getElementById('ws-badge');
+                if (badge && (!ws || ws.readyState !== WebSocket.OPEN)) {
+                    badge.style.display = 'inline-block';
+                    badge.className = 'badge';
+                    badge.style.background = 'var(--openbg)';
+                    badge.style.color = 'var(--accent)';
+                    badge.textContent = '● LIVE (HTTP)';
+                }
+            })
+            .catch(() => {});
+    }
+
     function connect() {
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = proto + '//' + location.host + '/ws' + location.search;
@@ -278,23 +325,8 @@ WS_SCRIPT = """<script>
         ws.onmessage = function(event) {
             try {
                 const data = JSON.parse(event.data);
-                if (data.type === 'trade_update' && data.html) {
-                    if (data.html.active_banner !== undefined) {
-                        const banner = document.getElementById('active-trades-container');
-                        if (banner) banner.innerHTML = data.html.active_banner;
-                    }
-                    if (data.html.trade_table !== undefined) {
-                        const table = document.getElementById('trades-table-container');
-                        if (table) table.innerHTML = data.html.trade_table;
-                    }
-                    if (data.html.day_cards !== undefined) {
-                        const cards = document.getElementById('day-cards-container');
-                        if (cards) cards.innerHTML = data.html.day_cards;
-                    }
-                    if (data.updated_at) {
-                        const timeEl = document.getElementById('updated-time-text');
-                        if (timeEl) timeEl.textContent = 'Updated ' + data.updated_at;
-                    }
+                if (data.type === 'trade_update') {
+                    updateDOM(data);
                 }
             } catch (err) {}
         };
@@ -308,13 +340,20 @@ WS_SCRIPT = """<script>
                 badge.textContent = '○ WS RECONNECTING';
             }
             clearTimeout(timer);
-            timer = setTimeout(connect, 2000);
+            timer = setTimeout(connect, 1500);
         };
         ws.onerror = function() {
             try { ws.close(); } catch (e) {}
         };
     }
     connect();
+
+    // Fallback: poll every 1.5s if WS is down or inactive
+    setInterval(function() {
+        if (!ws || ws.readyState !== WebSocket.OPEN || (Date.now() - lastUpdateTs > 3000)) {
+            pollFallback();
+        }
+    }, 1500);
 })();
 </script>"""
 
@@ -494,14 +533,13 @@ def make_close_frame() -> bytes:
     return bytes([0x88, 0x00])
 
 
-def broadcast_trade_update(day: str | None = None) -> None:
+def get_trade_update_payload(target_day: str) -> dict:
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    target_day = day or today_str
     trades = load_trades(target_day)
     s = summarize(trades)
     now_str = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
 
-    payload = {
+    return {
         "type": "trade_update",
         "day": target_day,
         "updated_at": now_str,
@@ -528,9 +566,15 @@ def broadcast_trade_update(day: str | None = None) -> None:
             "active_banner": active_trades_banner(trades),
             "trade_table": trade_table(trades),
             "day_cards": day_cards_html(s, live=(target_day == today_str)),
+            "pnl_chart": bar_chart([(t["symbol"], t["pnl"]) for t in trades]),
         },
     }
 
+
+def broadcast_trade_update(day: str | None = None) -> None:
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    target_day = day or today_str
+    payload = get_trade_update_payload(target_day)
     frame = make_ws_frame(json.dumps(payload))
     with _CLIENTS_LOCK:
         dead = []
@@ -545,23 +589,22 @@ def broadcast_trade_update(day: str | None = None) -> None:
 
 
 def _trade_watcher():
-    last_mtime = 0.0
+    last_mtimes: dict[str, float] = {}
     while True:
         time.sleep(0.5)
-        with _CLIENTS_LOCK:
-            has_clients = bool(_WS_CLIENTS)
-        if not has_clients:
-            continue
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        trades_file = DATA / today_str / "trades.csv"
-        try:
-            if trades_file.exists():
-                mtime = trades_file.stat().st_mtime
-                if mtime != last_mtime:
-                    last_mtime = mtime
-                    broadcast_trade_update(today_str)
-        except Exception:
-            pass
+        with _CLIENTS_LOCK:
+            days_to_check = set(_WS_CLIENTS.values()) | {today_str}
+        for d in days_to_check:
+            trades_file = DATA / d / "trades.csv"
+            try:
+                if trades_file.exists():
+                    mtime = trades_file.stat().st_mtime
+                    if mtime != last_mtimes.get(d, 0.0):
+                        last_mtimes[d] = mtime
+                        broadcast_trade_update(d)
+            except Exception:
+                pass
 
 
 def start_watcher():
@@ -575,12 +618,14 @@ def render(requested_day: str | None = None) -> str:
     today = datetime.now(IST).strftime("%Y-%m-%d")
     days = list_days()
     day = requested_day if requested_day and DATE_RE.match(requested_day) else today
-    live = day == today
 
     trades = load_trades(day)
     s = summarize(trades)
     hist = history()
     h = hist["stats"]
+
+    has_open = any(t.get("status") == "OPEN" for t in trades)
+    live = (day == today) or has_open
 
     day_cards = day_cards_html(s, live)
     pf = "n/a" if h["profit_factor"] is None else f'{h["profit_factor"]:.2f}'
@@ -603,7 +648,6 @@ def render(requested_day: str | None = None) -> str:
     skipped = small_table(_read_rows(DATA / day / "skipped.csv"),
                           [("symbol", "Stock"), ("reason", "Why it was skipped")])
 
-    has_open = any(t.get("status") == "OPEN" for t in trades)
     refresh_seconds = 5 if has_open else 10 if live else REFRESH_SECONDS
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if live else ""
     now = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
@@ -624,7 +668,7 @@ def render(requested_day: str | None = None) -> str:
 <h2>Trades: entry and exit</h2>
 <div id="trades-table-container">{trade_table(trades)}</div>
 
-<div class="two"><div><h2>P&amp;L per trade</h2>{bar_chart([(t["symbol"], t["pnl"]) for t in trades])}</div>
+<div class="two"><div id="pnl-chart-container"><h2>P&amp;L per trade</h2>{bar_chart([(t["symbol"], t["pnl"]) for t in trades])}</div>
 <div><h2>Selected movers</h2>{movers}<h2>Skipped trades</h2>{skipped}</div></div>
 
 <h2>All days</h2>
@@ -639,13 +683,29 @@ exact stop price, so real trading would differ (slippage, spreads). Win rate cou
 
 # ------------------------------------------------------------------------ server
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self):                                       # noqa: N802 (stdlib name)
         url = urlparse(self.path)
         if url.path == "/ws":
-            if self.headers.get("Upgrade", "").lower() == "websocket":
+            upgrade = self.headers.get("Upgrade", "").lower()
+            if "websocket" in upgrade:
                 self.handle_websocket(url)
                 return
             self.send_error(400, "Bad Request: Expected WebSocket Upgrade")
+            return
+        if url.path == "/api/trades":
+            day = parse_qs(url.query).get("date", [None])[0] or datetime.now(IST).strftime("%Y-%m-%d")
+            payload = get_trade_update_payload(day)
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
             return
         if url.path != "/":
             self.send_error(404)
@@ -658,6 +718,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def log_message(self, *args):                           # keep the console quiet
         pass
@@ -673,47 +734,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", accept_val)
         self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
 
         sock = self.connection
         target_day = parse_qs(url.query).get("date", [None])[0] or datetime.now(IST).strftime("%Y-%m-%d")
         with _CLIENTS_LOCK:
             _WS_CLIENTS[sock] = target_day
 
+        def _recv_exact(n):
+            buf = b""
+            while len(buf) < n:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    return None
+                buf += chunk
+            return buf
+
         # Send initial data immediately
         try:
-            today_str = datetime.now(IST).strftime("%Y-%m-%d")
-            trades = load_trades(target_day)
-            s = summarize(trades)
-            now_str = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
-            init_payload = {
-                "type": "trade_update",
-                "day": target_day,
-                "updated_at": now_str,
-                "trades_count": len(trades),
-                "open_count": s["open"],
-                "net_pnl": s["net"],
-                "trades": [
-                    {
-                        "symbol": t.get("symbol"),
-                        "direction": t.get("direction"),
-                        "ltp": t.get("ltp"),
-                        "entry": t.get("entry"),
-                        "price_change": t.get("price_change"),
-                        "price_change_pct": t.get("price_change_pct"),
-                        "trail_sl": t.get("trail_sl"),
-                        "pnl": t.get("pnl"),
-                        "r_multiple": t.get("r_multiple"),
-                        "status": t.get("status"),
-                        "trailing": t.get("trailing"),
-                    }
-                    for t in trades
-                ],
-                "html": {
-                    "active_banner": active_trades_banner(trades),
-                    "trade_table": trade_table(trades),
-                    "day_cards": day_cards_html(s, live=(target_day == today_str)),
-                },
-            }
+            init_payload = get_trade_update_payload(target_day)
             sock.sendall(make_ws_frame(json.dumps(init_payload)))
         except Exception:
             with _CLIENTS_LOCK:
@@ -723,7 +763,7 @@ class Handler(BaseHTTPRequestHandler):
         # Keep reading frames until disconnect or close
         try:
             while True:
-                b1b2 = sock.recv(2)
+                b1b2 = _recv_exact(2)
                 if not b1b2 or len(b1b2) < 2:
                     break
                 b1, b2 = b1b2[0], b1b2[1]
@@ -736,25 +776,22 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 payload_len = b2 & 0x7F
                 if payload_len == 126:
-                    raw_len = sock.recv(2)
-                    if len(raw_len) < 2:
+                    raw_len = _recv_exact(2)
+                    if not raw_len:
                         break
                     payload_len = struct.unpack("!H", raw_len)[0]
                 elif payload_len == 127:
-                    raw_len = sock.recv(8)
-                    if len(raw_len) < 8:
+                    raw_len = _recv_exact(8)
+                    if not raw_len:
                         break
                     payload_len = struct.unpack("!Q", raw_len)[0]
                 is_masked = (b2 & 0x80) != 0
-                mask = sock.recv(4) if is_masked else b""
-                payload = b""
-                remaining = payload_len
-                while remaining > 0:
-                    chunk = sock.recv(min(remaining, 4096))
-                    if not chunk:
-                        break
-                    payload += chunk
-                    remaining -= len(chunk)
+                mask = _recv_exact(4) if is_masked else b""
+                if is_masked and not mask:
+                    break
+                payload = _recv_exact(payload_len) if payload_len > 0 else b""
+                if payload_len > 0 and payload is None:
+                    break
                 if opcode == 9:  # Ping
                     try:
                         sock.sendall(make_pong_frame(payload))
