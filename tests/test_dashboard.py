@@ -171,6 +171,52 @@ class RenderTests(unittest.TestCase):
         html = dashboard.render("../../etc/passwd")
         self.assertNotIn("passwd", html)
 
+    def test_render_live_includes_websocket_script_and_containers(self):
+        html = dashboard.render()
+        self.assertIn("<script>", html)
+        self.assertIn("WebSocket", html)
+        self.assertIn('id="active-trades-container"', html)
+        self.assertIn('id="trades-table-container"', html)
+        self.assertIn('id="day-cards-container"', html)
+        self.assertIn('id="ws-badge"', html)
+
+    def test_websocket_frame_encoding(self):
+        # Short payload (<126 bytes)
+        frame1 = dashboard.make_ws_frame("hello")
+        self.assertEqual(frame1[:2], b"\x81\x05")
+        self.assertEqual(frame1[2:], b"hello")
+
+        # Medium payload (>=126 bytes)
+        payload2 = "x" * 200
+        frame2 = dashboard.make_ws_frame(payload2)
+        self.assertEqual(frame2[0], 0x81)
+        self.assertEqual(frame2[1], 126)
+        self.assertEqual(len(frame2), 2 + 2 + 200)
+
+        # Control frames
+        self.assertEqual(dashboard.make_pong_frame(b"ping"), b"\x8a\x04ping")
+        self.assertEqual(dashboard.make_close_frame(), b"\x88\x00")
+
+    def test_broadcast_trade_update_sends_to_clients(self):
+        write_day(self.root, "2026-09-25", [trade("RELIANCE", 1500.0, status="OPEN")])
+        mock_socket = mock.MagicMock()
+        with dashboard._CLIENTS_LOCK:
+            dashboard._WS_CLIENTS[mock_socket] = "2026-09-25"
+
+        try:
+            dashboard.broadcast_trade_update("2026-09-25")
+            mock_socket.sendall.assert_called_once()
+            call_args = mock_socket.sendall.call_args[0][0]
+            # Frame starts with 0x81 (text)
+            self.assertEqual(call_args[0], 0x81)
+            # Contains JSON payload with trade_update
+            self.assertIn(b"trade_update", call_args)
+            self.assertIn(b"RELIANCE", call_args)
+            self.assertIn(b"active_banner", call_args)
+        finally:
+            with dashboard._CLIENTS_LOCK:
+                dashboard._WS_CLIENTS.pop(mock_socket, None)
+
     def test_http_server(self):
         write_day(self.root, "2026-09-25", [trade("INFY", 77.0)])
         try:

@@ -623,6 +623,11 @@ class LiveTradeSession:
                 deduped.append(p)
         self.positions = deduped
         write_csv(DATA / today() / "trades.csv", [trade_row(p) for p in self.positions])
+        try:
+            import dashboard
+            dashboard.broadcast_trade_update(today())
+        except Exception:
+            pass
 
     def on_tick(self, sec_id: str, price: float, ts: int) -> None:
         with self.lock:
@@ -722,7 +727,7 @@ class LiveTradeSession:
             # Periodically write trades.csv so dashboard reflects live tick P&L and trailing stops
             now = time.time()
             has_open_pos = any(p.status == "OPEN" for p in self.positions)
-            persist_interval = 2.0 if has_open_pos else 5.0
+            persist_interval = 1.0 if has_open_pos else 5.0
             if now - self.last_csv_write > persist_interval:
                 self._persist()
                 self.last_csv_write = now

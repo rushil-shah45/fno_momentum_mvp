@@ -10,9 +10,15 @@ works without credentials, and also after the market has closed.
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
+import json
 import re
+import socket
+import struct
 import threading
+import time
 from datetime import date, datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +30,11 @@ from strategy import IST
 DATA = ROOT / "data"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 REFRESH_SECONDS = 30
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+_WS_CLIENTS: dict[socket.socket, str] = {}
+_CLIENTS_LOCK = threading.Lock()
+_WATCHER_STARTED = False
 
 
 # ------------------------------------------------------------------ formatting
@@ -235,9 +246,77 @@ th:first-child,td:first-child,th.l,td.l{text-align:left}
 .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
 .active-card{border:1.5px solid var(--accent);background:var(--openbg);padding:14px 16px;border-radius:10px}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.ws-live{animation:pulse 2s infinite}#ws-badge{display:none;margin-left:8px}
 tr.row-open{background:var(--openbg)}
 footer{margin-top:32px;font-size:12px;color:var(--muted)}
 """
+
+WS_SCRIPT = """<script>
+(function() {
+    let ws = null;
+    let timer = null;
+    function connect() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const url = proto + '//' + location.host + '/ws' + location.search;
+        try {
+            ws = new WebSocket(url);
+        } catch (e) {
+            return;
+        }
+        ws.onopen = function() {
+            const meta = document.querySelector('meta[http-equiv="refresh"]');
+            if (meta) meta.remove();
+            const badge = document.getElementById('ws-badge');
+            if (badge) {
+                badge.style.display = 'inline-block';
+                badge.className = 'badge ws-live';
+                badge.style.background = 'var(--posbg)';
+                badge.style.color = 'var(--pos)';
+                badge.textContent = '● WS LIVE';
+            }
+        };
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'trade_update' && data.html) {
+                    if (data.html.active_banner !== undefined) {
+                        const banner = document.getElementById('active-trades-container');
+                        if (banner) banner.innerHTML = data.html.active_banner;
+                    }
+                    if (data.html.trade_table !== undefined) {
+                        const table = document.getElementById('trades-table-container');
+                        if (table) table.innerHTML = data.html.trade_table;
+                    }
+                    if (data.html.day_cards !== undefined) {
+                        const cards = document.getElementById('day-cards-container');
+                        if (cards) cards.innerHTML = data.html.day_cards;
+                    }
+                    if (data.updated_at) {
+                        const timeEl = document.getElementById('updated-time-text');
+                        if (timeEl) timeEl.textContent = 'Updated ' + data.updated_at;
+                    }
+                }
+            } catch (err) {}
+        };
+        ws.onclose = function() {
+            const badge = document.getElementById('ws-badge');
+            if (badge) {
+                badge.style.display = 'inline-block';
+                badge.className = 'badge';
+                badge.style.background = 'var(--negbg)';
+                badge.style.color = 'var(--neg)';
+                badge.textContent = '○ WS RECONNECTING';
+            }
+            clearTimeout(timer);
+            timer = setTimeout(connect, 2000);
+        };
+        ws.onerror = function() {
+            try { ws.close(); } catch (e) {}
+        };
+    }
+    connect();
+})();
+</script>"""
 
 STATUS = {"OPEN": "Open", "EXIT_STOP": "Stop hit", "EXIT_FORCED": "Time exit",
           "EXIT_DAILY_LOSS": "Daily-loss exit"}
@@ -381,6 +460,117 @@ def small_table(rows: list[dict], cols: list[tuple[str, str]]) -> str:
     return f'<div class="wrap"><table style="min-width:0"><tr>{head}</tr>{body}</table></div>'
 
 
+def day_cards_html(s: dict, live: bool = False) -> str:
+    return "".join([
+        card("Net P&L" + (" (live)" if live else ""), inr(s["net"]),
+             f'realised {inr(s["realised"])} · open {inr(s["unrealised"])}', tone(s["net"])),
+        card("Win rate", pct(s["win_rate"]), f'{s["wins"]} won · {s["losses"]} lost · {s["open"]} open'),
+        card("Trades", str(s["trades"]), f'{s["closed"]} closed'),
+        card("Best / worst", f'{inr(s["best"])}', f'worst {inr(s["worst"])}', tone(s["best"])),
+        card("Avg win / loss", inr(s["avg_win"]), f'avg loss {inr(s["avg_loss"])}', "pos"),
+    ])
+
+
+def make_ws_frame(payload_str: str) -> bytes:
+    data = payload_str.encode("utf-8")
+    length = len(data)
+    if length < 126:
+        header = bytes([0x81, length])
+    elif length <= 0xFFFF:
+        header = struct.pack("!BBH", 0x81, 126, length)
+    else:
+        header = struct.pack("!BBQ", 0x81, 127, length)
+    return header + data
+
+
+def make_pong_frame(payload: bytes = b"") -> bytes:
+    length = len(payload)
+    if length < 126:
+        return bytes([0x8A, length]) + payload
+    return struct.pack("!BBH", 0x8A, 126, length) + payload
+
+
+def make_close_frame() -> bytes:
+    return bytes([0x88, 0x00])
+
+
+def broadcast_trade_update(day: str | None = None) -> None:
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    target_day = day or today_str
+    trades = load_trades(target_day)
+    s = summarize(trades)
+    now_str = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
+
+    payload = {
+        "type": "trade_update",
+        "day": target_day,
+        "updated_at": now_str,
+        "trades_count": len(trades),
+        "open_count": s["open"],
+        "net_pnl": s["net"],
+        "trades": [
+            {
+                "symbol": t.get("symbol"),
+                "direction": t.get("direction"),
+                "ltp": t.get("ltp"),
+                "entry": t.get("entry"),
+                "price_change": t.get("price_change"),
+                "price_change_pct": t.get("price_change_pct"),
+                "trail_sl": t.get("trail_sl"),
+                "pnl": t.get("pnl"),
+                "r_multiple": t.get("r_multiple"),
+                "status": t.get("status"),
+                "trailing": t.get("trailing"),
+            }
+            for t in trades
+        ],
+        "html": {
+            "active_banner": active_trades_banner(trades),
+            "trade_table": trade_table(trades),
+            "day_cards": day_cards_html(s, live=(target_day == today_str)),
+        },
+    }
+
+    frame = make_ws_frame(json.dumps(payload))
+    with _CLIENTS_LOCK:
+        dead = []
+        for sock, client_day in list(_WS_CLIENTS.items()):
+            if client_day == target_day or client_day == today_str:
+                try:
+                    sock.sendall(frame)
+                except Exception:
+                    dead.append(sock)
+        for d in dead:
+            _WS_CLIENTS.pop(d, None)
+
+
+def _trade_watcher():
+    last_mtime = 0.0
+    while True:
+        time.sleep(0.5)
+        with _CLIENTS_LOCK:
+            has_clients = bool(_WS_CLIENTS)
+        if not has_clients:
+            continue
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        trades_file = DATA / today_str / "trades.csv"
+        try:
+            if trades_file.exists():
+                mtime = trades_file.stat().st_mtime
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    broadcast_trade_update(today_str)
+        except Exception:
+            pass
+
+
+def start_watcher():
+    global _WATCHER_STARTED
+    if not _WATCHER_STARTED:
+        _WATCHER_STARTED = True
+        threading.Thread(target=_trade_watcher, daemon=True, name="dashboard-ws-watcher").start()
+
+
 def render(requested_day: str | None = None) -> str:
     today = datetime.now(IST).strftime("%Y-%m-%d")
     days = list_days()
@@ -392,14 +582,7 @@ def render(requested_day: str | None = None) -> str:
     hist = history()
     h = hist["stats"]
 
-    day_cards = "".join([
-        card("Net P&L" + (" (live)" if live else ""), inr(s["net"]),
-             f'realised {inr(s["realised"])} · open {inr(s["unrealised"])}', tone(s["net"])),
-        card("Win rate", pct(s["win_rate"]), f'{s["wins"]} won · {s["losses"]} lost · {s["open"]} open'),
-        card("Trades", str(s["trades"]), f'{s["closed"]} closed'),
-        card("Best / worst", f'{inr(s["best"])}', f'worst {inr(s["worst"])}', tone(s["best"])),
-        card("Avg win / loss", inr(s["avg_win"]), f'avg loss {inr(s["avg_loss"])}', "pos"),
-    ])
+    day_cards = day_cards_html(s, live)
     pf = "n/a" if h["profit_factor"] is None else f'{h["profit_factor"]:.2f}'
     all_cards = "".join([
         card("Total P&L", inr(h["net"]), f'over {h["days"]} day(s)', tone(h["net"])),
@@ -425,20 +608,21 @@ def render(requested_day: str | None = None) -> str:
     refresh = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if live else ""
     now = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
     refresh_note = f" · auto-refresh every {refresh_seconds}s (live position active)" if (live and has_open) else (f" · auto-refresh every {refresh_seconds}s" if live else "")
+    ws_script = WS_SCRIPT if live else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{refresh}
 <title>F&amp;O Momentum - Paper Dashboard</title><style>{CSS}</style></head><body><main>
 <header><h1>F&amp;O Momentum Dashboard <span class="badge">PAPER ONLY</span></h1>
-<span class="muted">Updated {escape(now)}{refresh_note}</span></header>
+<span class="muted"><span id="updated-time-text">Updated {escape(now)}</span>{refresh_note} <span id="ws-badge" class="badge"></span></span></header>
 <nav>{nav}</nav>
 
 <h2>{escape("Today" if live else day)} ({escape(day)})</h2>
-<div class="grid">{day_cards}</div>
+<div class="grid" id="day-cards-container">{day_cards}</div>
 
-{active_trades_banner(trades)}
+<div id="active-trades-container">{active_trades_banner(trades)}</div>
 
 <h2>Trades: entry and exit</h2>
-{trade_table(trades)}
+<div id="trades-table-container">{trade_table(trades)}</div>
 
 <div class="two"><div><h2>P&amp;L per trade</h2>{bar_chart([(t["symbol"], t["pnl"]) for t in trades])}</div>
 <div><h2>Selected movers</h2>{movers}<h2>Skipped trades</h2>{skipped}</div></div>
@@ -450,13 +634,19 @@ def render(requested_day: str | None = None) -> str:
 
 <footer>Simulated results only; no order is ever sent. Fills are assumed at the candle open and exits at the
 exact stop price, so real trading would differ (slippage, spreads). Win rate counts closed trades only.</footer>
-</main></body></html>"""
+</main>{ws_script}</body></html>"""
 
 
 # ------------------------------------------------------------------------ server
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):                                       # noqa: N802 (stdlib name)
         url = urlparse(self.path)
+        if url.path == "/ws":
+            if self.headers.get("Upgrade", "").lower() == "websocket":
+                self.handle_websocket(url)
+                return
+            self.send_error(400, "Bad Request: Expected WebSocket Upgrade")
+            return
         if url.path != "/":
             self.send_error(404)
             return
@@ -472,12 +662,121 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):                           # keep the console quiet
         pass
 
+    def handle_websocket(self, url):
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self.send_error(400, "Missing Sec-WebSocket-Key")
+            return
+        accept_val = base64.b64encode(hashlib.sha1((key.strip() + WS_GUID).encode("utf-8")).digest()).decode("utf-8")
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept_val)
+        self.end_headers()
+
+        sock = self.connection
+        target_day = parse_qs(url.query).get("date", [None])[0] or datetime.now(IST).strftime("%Y-%m-%d")
+        with _CLIENTS_LOCK:
+            _WS_CLIENTS[sock] = target_day
+
+        # Send initial data immediately
+        try:
+            today_str = datetime.now(IST).strftime("%Y-%m-%d")
+            trades = load_trades(target_day)
+            s = summarize(trades)
+            now_str = datetime.now(IST).strftime("%d %b %Y, %H:%M:%S IST")
+            init_payload = {
+                "type": "trade_update",
+                "day": target_day,
+                "updated_at": now_str,
+                "trades_count": len(trades),
+                "open_count": s["open"],
+                "net_pnl": s["net"],
+                "trades": [
+                    {
+                        "symbol": t.get("symbol"),
+                        "direction": t.get("direction"),
+                        "ltp": t.get("ltp"),
+                        "entry": t.get("entry"),
+                        "price_change": t.get("price_change"),
+                        "price_change_pct": t.get("price_change_pct"),
+                        "trail_sl": t.get("trail_sl"),
+                        "pnl": t.get("pnl"),
+                        "r_multiple": t.get("r_multiple"),
+                        "status": t.get("status"),
+                        "trailing": t.get("trailing"),
+                    }
+                    for t in trades
+                ],
+                "html": {
+                    "active_banner": active_trades_banner(trades),
+                    "trade_table": trade_table(trades),
+                    "day_cards": day_cards_html(s, live=(target_day == today_str)),
+                },
+            }
+            sock.sendall(make_ws_frame(json.dumps(init_payload)))
+        except Exception:
+            with _CLIENTS_LOCK:
+                _WS_CLIENTS.pop(sock, None)
+            return
+
+        # Keep reading frames until disconnect or close
+        try:
+            while True:
+                b1b2 = sock.recv(2)
+                if not b1b2 or len(b1b2) < 2:
+                    break
+                b1, b2 = b1b2[0], b1b2[1]
+                opcode = b1 & 0x0F
+                if opcode == 8:  # Close frame
+                    try:
+                        sock.sendall(make_close_frame())
+                    except Exception:
+                        pass
+                    break
+                payload_len = b2 & 0x7F
+                if payload_len == 126:
+                    raw_len = sock.recv(2)
+                    if len(raw_len) < 2:
+                        break
+                    payload_len = struct.unpack("!H", raw_len)[0]
+                elif payload_len == 127:
+                    raw_len = sock.recv(8)
+                    if len(raw_len) < 8:
+                        break
+                    payload_len = struct.unpack("!Q", raw_len)[0]
+                is_masked = (b2 & 0x80) != 0
+                mask = sock.recv(4) if is_masked else b""
+                payload = b""
+                remaining = payload_len
+                while remaining > 0:
+                    chunk = sock.recv(min(remaining, 4096))
+                    if not chunk:
+                        break
+                    payload += chunk
+                    remaining -= len(chunk)
+                if opcode == 9:  # Ping
+                    try:
+                        sock.sendall(make_pong_frame(payload))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            with _CLIENTS_LOCK:
+                _WS_CLIENTS.pop(sock, None)
+            try:
+                sock.close()
+            except Exception:
+                pass
+
 
 def make_server(host: str = "127.0.0.1", port: int = 8501) -> ThreadingHTTPServer:
     return ThreadingHTTPServer((host, port), Handler)
 
 
 def serve(host: str = "127.0.0.1", port: int = 8501) -> None:
+    start_watcher()
     server = make_server(host, port)
     print(f"Dashboard running at http://{host}:{port}  (Ctrl+C to stop)")
     try:
@@ -487,6 +786,7 @@ def serve(host: str = "127.0.0.1", port: int = 8501) -> None:
 
 
 def start_in_background(host: str = "127.0.0.1", port: int = 8501) -> ThreadingHTTPServer:
+    start_watcher()
     server = make_server(host, port)
     threading.Thread(target=server.serve_forever, daemon=True, name="dashboard").start()
     return server
