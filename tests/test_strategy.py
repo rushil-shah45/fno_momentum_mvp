@@ -20,7 +20,7 @@ def bar(hhmm, o, h, l, c):
     return Bar(ts(hhmm), o, h, l, c)
 
 
-ARGS = dict(tolerance=0.05, close_zone=0.20, max_range_pct=3.0)
+ARGS = dict(tolerance=0.05)
 CE = Contract("1", "CE", date(2026, 9, 29), 100.0, 100)
 
 
@@ -35,12 +35,14 @@ class ClassifyTests(unittest.TestCase):
     def test_put(self):
         self.assertEqual(classify(OpeningRange(102, 102, 100, 100.1), **ARGS)[0], "PUT")
 
-    def test_close_not_near_extreme(self):
-        self.assertEqual(classify(OpeningRange(100, 102, 100, 101.0), **ARGS)[0], "")
+    def test_close_not_near_extreme_still_qualifies(self):
+        self.assertEqual(classify(OpeningRange(100, 102, 100, 101.0), **ARGS)[0], "CALL")
 
-    def test_range_too_large(self):
-        self.assertEqual(classify(OpeningRange(100, 110, 100, 109.9), **ARGS)[1],
-                         "opening range too large")
+    def test_large_range_still_qualifies(self):
+        self.assertEqual(classify(OpeningRange(100, 110, 100, 109.9), **ARGS)[0], "CALL")
+
+    def test_pattern_not_qualified(self):
+        self.assertEqual(classify(OpeningRange(101, 102, 100, 101.5), **ARGS)[0], "")
 
     def test_flat(self):
         self.assertEqual(classify(OpeningRange(100, 100, 100, 100), **ARGS)[0], "")

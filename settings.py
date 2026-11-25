@@ -54,8 +54,6 @@ class Settings:
 
     # Strategy constants (see README for the reasoning behind each one)
     tolerance: float = 0.05         # "Open = Low" allows one NSE tick of slack
-    close_zone: float = 0.20        # 5-min close must be in top/bottom 20% of range
-    max_range_pct: float = 3.0      # skip stocks whose 5-min range is > 3%
     min_days_to_expiry: int = 3     # avoid contracts about to expire
 
 

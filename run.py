@@ -110,7 +110,7 @@ def cmd_scan(cfg: Settings, use_history: bool) -> None:
                                    float(q.get("last_price") or o["close"]), float(q.get("volume", 0)))
             else:
                 rng = broker.stock_opening_range(sid, day)
-            direction, reason, range_pct = classify(rng, cfg.tolerance, cfg.close_zone, cfg.max_range_pct)
+            direction, reason, range_pct = classify(rng, cfg.tolerance)
             prev_close = float(q.get("ohlc", {}).get("close") or 0)
             last = float(q.get("last_price") or 0)
             change = (last - prev_close) / prev_close * 100 if prev_close and last else 0.0

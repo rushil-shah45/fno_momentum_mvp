@@ -55,27 +55,22 @@ def fmt_time(ts: int | None) -> str:
 
 
 # ------------------------------------------------------------ 1. the setup signal
-def classify(r: OpeningRange, tolerance: float, close_zone: float,
-             max_range_pct: float) -> tuple[str, str, float]:
+def classify(r: OpeningRange, tolerance: float) -> tuple[str, str, float]:
     """Return (direction, reason, range_pct) for the 09:15 5-min opening candle.
 
-    CALL: Open = Low  and the 5-min close in the top 20% of the range (bullish candle).
-    PUT : Open = High and the 5-min close in the bottom 20% of the range (bearish candle).
+    CALL: Open = Low (bullish candle).
+    PUT : Open = High (bearish candle).
     direction is "" when the stock does not qualify.
     """
     rng = r.high - r.low
     if rng <= 0 or r.low <= 0:
         return "", "flat opening range", 0.0
     range_pct = rng / r.low * 100
-    if range_pct > max_range_pct:
-        return "", "opening range too large", range_pct
 
-    close_near_high = (r.high - r.close) <= rng * close_zone
-    close_near_low = (r.close - r.low) <= rng * close_zone
-    if abs(r.open - r.low) <= tolerance and close_near_high:
-        return "CALL", "Open = Low, 5-min close near High (bullish)", range_pct
-    if abs(r.high - r.open) <= tolerance and close_near_low:
-        return "PUT", "Open = High, 5-min close near Low (bearish)", range_pct
+    if abs(r.open - r.low) <= tolerance:
+        return "CALL", "Open = Low (bullish)", range_pct
+    if abs(r.high - r.open) <= tolerance:
+        return "PUT", "Open = High (bearish)", range_pct
     return "", "pattern not qualified", range_pct
 
 
