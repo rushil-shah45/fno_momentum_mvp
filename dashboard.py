@@ -119,13 +119,14 @@ def list_days() -> list[str]:
 
 
 def summarize(trades: list[dict]) -> dict:
-    closed = [t for t in trades if t["status"] != "OPEN"]
+    closed = [t for t in trades if t["status"] not in ("OPEN", "PENDING")]
     wins = [t for t in closed if t["pnl"] > 0]
     losses = [t for t in closed if t["pnl"] < 0]
     gross_win = sum(t["pnl"] for t in wins)
     gross_loss = -sum(t["pnl"] for t in losses)
+    open_count = sum(1 for t in trades if t["status"] == "OPEN")
     return {
-        "trades": len(trades), "open": len(trades) - len(closed), "closed": len(closed),
+        "trades": len(trades), "open": open_count, "closed": len(closed),
         "wins": len(wins), "losses": len(losses),
         "win_rate": len(wins) / len(closed) * 100 if closed else None,
         "net": sum(t["pnl"] for t in trades),
@@ -357,8 +358,8 @@ WS_SCRIPT = """<script>
 })();
 </script>"""
 
-STATUS = {"OPEN": "Open", "EXIT_STOP": "Stop hit", "EXIT_FORCED": "Time exit",
-          "EXIT_DAILY_LOSS": "Daily-loss exit"}
+STATUS = {"OPEN": "Open", "PENDING": "Pending", "EXIT_STOP": "Stop hit", "EXIT_FORCED": "Time exit",
+          "EXIT_DAILY_LOSS": "Daily-loss exit", "EXIT_EXTERNAL": "External exit"}
 
 
 def card(key: str, value: str, sub: str = "", cls: str = "") -> str:
@@ -369,6 +370,8 @@ def card(key: str, value: str, sub: str = "", cls: str = "") -> str:
 def status_tag(t: dict) -> str:
     if t["status"] == "OPEN":
         return '<span class="tag open">Open</span>'
+    if t["status"] == "PENDING":
+        return '<span class="tag flat">Pending</span>'
     label = STATUS.get(t["status"], t["status"])
     if t["status"] == "EXIT_STOP" and t["pnl"] > 0:
         label = "Trailed out"

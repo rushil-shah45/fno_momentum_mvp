@@ -653,6 +653,57 @@ class PositionStatusAndRefreshTests(unittest.TestCase):
             mock_broker.place_order.assert_not_called()
             mock_broker.option_candles.assert_not_called()
 
+    def test_live_activation_marks_pending_until_broker_position_is_open(self):
+        cfg = Settings(
+            active_broker="indmoney",
+            trading_mode="live",
+            max_risk_per_trade=10000.0,
+            enforce_risk_limit=False,
+        )
+        mock_broker = mock.MagicMock()
+        t0 = int(datetime(2026, 11, 9, 9, 15).timestamp())
+        t1 = int(datetime(2026, 11, 9, 9, 20).timestamp())
+        bars = [
+            Bar(t0, open=100.0, high=105.0, low=95.0, close=100.0, volume=1000),
+            Bar(t1, open=100.0, high=110.0, low=98.0, close=108.0, volume=2000),
+        ]
+        mock_broker.option_candles.return_value = bars
+        mock_broker.check_margin_available.return_value = (True, 27000.0, 50000.0)
+        mock_broker.place_order.return_value = {"order_id": "ORD555", "status": "PLACED"}
+        mock_broker.get_trade_list.return_value = []
+        mock_broker.get_order_list.return_value = [
+            {"order_id": "ORD555", "status": "REQUESTED", "average_price": 0.0}
+        ]
+        # Broker has NO open position yet
+        mock_broker.get_positions.return_value = []
+
+        movers = [{"symbol": "RELIANCE", "direction": "CALL", "security_id": "2885", "close": 2800.0}]
+        picks = {"RELIANCE": self.contract}
+
+        with mock.patch("run.today", return_value="2026-11-09"):
+            positions = run.simulate_once(cfg, mock_broker, movers, picks, now_time=time(9, 25))
+            self.assertEqual(len(positions), 1)
+            pos = positions[0]
+            self.assertEqual(pos.status, "PENDING")
+
+            # 10s check while still pending on broker: must NOT show OPEN
+            session = run.LiveTradeSession(cfg, mock_broker, movers, picks, positions)
+            report1 = session.check_status_10s()
+            self.assertEqual(report1["RELIANCE"]["position_status"], "PENDING")
+            self.assertEqual(pos.status, "PENDING")
+
+            # Now broker fills the order and shows an open position
+            mock_broker.get_order_list.return_value = [
+                {"order_id": "ORD555", "status": "EXECUTED", "average_price": 107.5}
+            ]
+            mock_broker.get_positions.return_value = [
+                {"security_id": "51011", "symbol": "RELIANCE26NOV2800CE", "net_qty": 250, "ltp": 109.0}
+            ]
+            report2 = session.check_status_10s()
+            self.assertEqual(pos.status, "OPEN")
+            self.assertIn("OPEN (Broker Qty: 250)", report2["RELIANCE"]["position_status"])
+            self.assertEqual(pos.entry, 107.5)
+
 
 if __name__ == "__main__":
     unittest.main()

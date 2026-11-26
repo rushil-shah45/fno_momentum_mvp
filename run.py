@@ -193,7 +193,7 @@ def load_existing_positions(day_str: str, picks: dict[str, Contract]) -> list[Po
                         order_id=r.get("order_id", ""),
                         exit_order_id=r.get("exit_order_id", ""),
                     )
-                    if status != "OPEN":
+                    if status not in ("OPEN", "PENDING"):
                         pos.exit_price = last_px
                         pos.exit_ts = int(datetime.now(IST).timestamp())
                     positions.append(pos)
@@ -338,6 +338,112 @@ def is_script_traded_today(symbol: str, contract: Contract | None = None,
     return False
 
 
+_PENDING_ORDER_STATUSES = {
+    "PENDING", "OPEN", "ORDERED", "REQUESTED", "TRANSIT", "TRIGGER PENDING",
+    "OPEN PENDING", "VALIDATION PENDING", "MODIFY PENDING", "MODIFY VALIDATION PENDING",
+    "AFTER_MARKET_ORDER_REQ_RECEIVED", "PLACED",
+}
+
+
+def _find_broker_position(broker_positions, sym: str, contract: Contract | None) -> tuple[dict | None, float]:
+    """Find a matching position entry in broker_positions and return (match_dict, net_qty)."""
+    if not isinstance(broker_positions, list):
+        return None, 0.0
+    for bp in broker_positions:
+        if not isinstance(bp, dict):
+            continue
+        sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
+        b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
+        if (sym and b_sym and (sym in b_sym or b_sym in sym)) or (
+            contract and sec_id and (contract.security_id in sec_id or sec_id in contract.security_id)
+        ):
+            net_qty = float(
+                bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity")
+                or bp.get("quantity") or bp.get("qty") or 0.0
+            )
+            return bp, net_qty
+    return None, 0.0
+
+
+def _sync_live_activation(broker, pos: Position, sym: str, contract: Contract, prefix: str = "") -> None:
+    """After placing a live order, check broker trades, orders, and positions.
+    Only mark pos.status as 'OPEN' if the broker confirms an open position (net_qty > 0);
+    otherwise mark it 'PENDING' (or close it if rejected/cancelled).
+    """
+    time.sleep(1)
+    order_id = pos.order_id
+    ord_status = ""
+
+    try:
+        trades = broker.get_trade_list(today())
+        if isinstance(trades, list):
+            matched_trade = None
+            for t in trades:
+                if not isinstance(t, dict):
+                    continue
+                t_oid = str(t.get("order_id") or "")
+                t_sec = str(t.get("security_id") or "")
+                t_sym = str(t.get("symbol") or "")
+                if order_id and t_oid == order_id:
+                    matched_trade = t
+                    break
+                if t.get("action", "").upper() == "BUY" and (
+                    sym in t_sym or t_sec in contract.security_id or t_sym in contract.security_id
+                ):
+                    matched_trade = t
+                    break
+            if matched_trade:
+                exec_px = float(matched_trade.get("price") or 0.0)
+                if exec_px > 0:
+                    pos.entry = exec_px
+                    pos.executed_entry = exec_px
+                    pos.risk = abs(pos.entry - pos.initial_stop)
+                    print(f"{prefix}[LIVE TRADE CONFIRMED] {sym} filled at Rs {exec_px:.2f} "
+                          f"(Trade ID: {matched_trade.get('trade_id', order_id)})")
+    except Exception as e:
+        print(f"{prefix}[LIVE TRADE LIST] Could not verify broker trade list for {sym}: {e}")
+
+    try:
+        orders = broker.get_order_list(today())
+        if isinstance(orders, list):
+            matched_order = next(
+                (o for o in orders if isinstance(o, dict) and str(o.get("order_id") or o.get("order_reference") or "") == order_id),
+                None,
+            )
+            if matched_order:
+                ord_status = str(matched_order.get("status") or matched_order.get("order_status") or "").upper()
+                avg_px = float(matched_order.get("average_price") or matched_order.get("price") or 0.0)
+                if avg_px > 0 and pos.executed_entry is None:
+                    pos.entry = avg_px
+                    pos.executed_entry = avg_px
+                    pos.risk = abs(pos.entry - pos.initial_stop)
+                if ord_status in ("REJECTED", "CANCELLED"):
+                    pos.close(0.0, int(time.time()), f"ORDER_{ord_status}")
+                    print(f"{prefix}[LIVE ORDER {ord_status}] {sym} order {order_id} was {ord_status}.")
+                    return
+                print(f"{prefix}[LIVE ORDER STATUS] Order {order_id} on broker: {ord_status} (Avg Price: Rs {pos.entry:.2f})")
+    except Exception as e:
+        log.debug("Order list check failed for %s: %s", sym, e)
+
+    try:
+        broker_positions = broker.get_positions()
+        if isinstance(broker_positions, list):
+            b_match, net_qty = _find_broker_position(broker_positions, sym, contract)
+            if b_match is not None and net_qty > 0:
+                pos.status = "OPEN"
+                print(f"{prefix}[LIVE POSITION OPEN] {sym} confirmed open on broker (Qty: {int(net_qty)}, Entry: Rs {pos.entry:.2f})")
+            else:
+                pos.status = "PENDING"
+                print(f"{prefix}[LIVE ORDER PENDING] {sym} order {order_id} is pending (not yet an open position on broker).")
+            return
+    except Exception as e:
+        log.debug("Broker positions check failed for %s: %s", sym, e)
+
+    if ord_status in _PENDING_ORDER_STATUSES and pos.executed_entry is None:
+        pos.status = "PENDING"
+        print(f"{prefix}[LIVE ORDER PENDING] {sym} order {order_id} status is {ord_status} on broker.")
+
+
 def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
                   existing_positions: list[Position] | None = None,
                   now_time: time | None = None) -> list[Position]:
@@ -428,49 +534,11 @@ def simulate_once(cfg: Settings, broker, movers: list[dict], picks: dict,
                 pos.order_id = order_id
                 print(f"[LIVE ORDER PLACED] {pos.symbol} BUY {pos.qty} {contract.option_type} {contract.strike} (Order ID: {order_id})")
 
-                # After taking trade, check trade list from broker so code can observe from it
-                time.sleep(1)
-                try:
-                    trades = broker.get_trade_list(today())
-                    matched_trade = None
-                    for t in trades:
-                        t_oid = str(t.get("order_id") or "")
-                        t_sec = str(t.get("security_id") or "")
-                        t_sym = str(t.get("symbol") or "")
-                        if order_id and t_oid == order_id:
-                            matched_trade = t
-                            break
-                        if t.get("action", "").upper() == "BUY" and (sym in t_sym or t_sec in contract.security_id or t_sym in contract.security_id):
-                            matched_trade = t
-                            break
-
-                    if matched_trade:
-                        exec_px = float(matched_trade.get("price") or 0.0)
-                        if exec_px > 0:
-                            pos.entry = exec_px
-                            pos.executed_entry = exec_px
-                            pos.risk = abs(pos.entry - pos.initial_stop)
-                            print(f"[LIVE TRADE CONFIRMED] Broker trade list verified: {pos.symbol} filled at Rs {exec_px:.2f} "
-                                  f"(Trade ID: {matched_trade.get('trade_id', order_id)}, Qty: {pos.qty})")
-                    else:
-                        # Check order book status too
-                        try:
-                            orders = broker.get_order_list(today())
-                            matched_order = next((o for o in orders if str(o.get("order_id") or o.get("order_reference") or "") == order_id), None)
-                            if matched_order:
-                                ord_status = str(matched_order.get("status") or matched_order.get("order_status") or "").upper()
-                                avg_px = float(matched_order.get("average_price") or matched_order.get("price") or 0.0)
-                                if avg_px > 0:
-                                    pos.entry = avg_px
-                                    pos.executed_entry = avg_px
-                                    pos.risk = abs(pos.entry - pos.initial_stop)
-                                print(f"[LIVE ORDER STATUS] Order {order_id} on broker: {ord_status} (Avg Price: Rs {pos.entry:.2f})")
-                            else:
-                                print(f"[LIVE TRADE OBSERVED] Watching live position {pos.symbol} from broker with entry Rs {pos.entry:.2f}")
-                        except Exception:
-                            print(f"[LIVE TRADE OBSERVED] Watching live position {pos.symbol} from broker with entry Rs {pos.entry:.2f}")
-                except Exception as t_err:
-                    print(f"[LIVE TRADE LIST] Could not verify broker trade list for {pos.symbol}: {t_err}")
+                # After taking trade, check broker trade list, order book, and open positions
+                _sync_live_activation(broker, pos, sym, contract)
+                if pos.status in ("ORDER_REJECTED", "ORDER_CANCELLED"):
+                    skipped.append((sym, f"order {pos.status.lower()}"))
+                    continue
             except Exception as e:
                 err_msg = f"Order placement failed: {e}"
                 print(f"[LIVE ORDER ERROR] {sym}: {err_msg}")
@@ -747,6 +815,7 @@ class LiveTradeSession:
         broker_orders = []
         broker_trades = []
         broker_positions = []
+        positions_fetched = False
         if is_live and self.broker:
             try:
                 broker_orders = self.broker.get_order_list(today()) or []
@@ -757,7 +826,10 @@ class LiveTradeSession:
             except Exception as e:
                 log.debug("10s check: error fetching trade list: %s", e)
             try:
-                broker_positions = self.broker.get_positions() or []
+                raw_positions = self.broker.get_positions()
+                if isinstance(raw_positions, list):
+                    broker_positions = raw_positions
+                    positions_fetched = True
             except Exception as e:
                 log.debug("10s check: error fetching positions: %s", e)
 
@@ -767,6 +839,7 @@ class LiveTradeSession:
         # Refresh latest broker quotes so LTP and trailing stop are up to date
         self._poll_quotes()
 
+        status_changed = False
         with self.lock:
             for m in self.movers:
                 sym = m["symbol"]
@@ -779,10 +852,14 @@ class LiveTradeSession:
                 if pos:
                     trade_status = f"ORDER_PLACED ({pos.order_id})" if pos.order_id else "PAPER_ACTIVE"
                     position_status = pos.status
+                    ord_st = ""
 
                     # Sync live orders if live mode
                     if is_live and pos.order_id:
-                        matched_order = next((o for o in broker_orders if str(o.get("order_id") or o.get("order_reference") or "") == pos.order_id), None)
+                        matched_order = next(
+                            (o for o in broker_orders if isinstance(o, dict) and str(o.get("order_id") or o.get("order_reference") or "") == pos.order_id),
+                            None,
+                        )
                         if matched_order:
                             ord_st = str(matched_order.get("status") or matched_order.get("order_status") or "").upper()
                             trade_status = f"ORDER_{ord_st} ({pos.order_id})"
@@ -792,37 +869,64 @@ class LiveTradeSession:
                                 pos.entry = avg_px
                                 pos.risk = abs(pos.entry - pos.initial_stop)
 
-                            if ord_st in ("REJECTED", "CANCELLED") and pos.status == "OPEN":
+                            if ord_st in ("REJECTED", "CANCELLED") and pos.status in ("OPEN", "PENDING"):
                                 pos.close(0.0, now_ts, f"ORDER_{ord_st}")
                                 position_status = pos.status
+                                status_changed = True
 
                         if pos.exit_order_id:
-                            matched_exit = next((o for o in broker_orders if str(o.get("order_id") or o.get("order_reference") or "") == pos.exit_order_id), None)
+                            matched_exit = next(
+                                (o for o in broker_orders if isinstance(o, dict) and str(o.get("order_id") or o.get("order_reference") or "") == pos.exit_order_id),
+                                None,
+                            )
                             if matched_exit:
                                 exit_st = str(matched_exit.get("status") or matched_exit.get("order_status") or "").upper()
                                 trade_status += f" | EXIT_{exit_st} ({pos.exit_order_id})"
 
                     # Check broker open derivative positions
-                    if is_live and broker_positions and contract:
-                        b_match = None
-                        for bp in broker_positions:
-                            sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
-                            b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
-                            if (sym in b_sym or b_sym in sym) or (contract.security_id in sec_id or sec_id in contract.security_id):
-                                b_match = bp
-                                break
+                    if is_live and positions_fetched and contract and pos.status in ("OPEN", "PENDING"):
+                        b_match, net_qty = _find_broker_position(broker_positions, sym, contract)
 
-                        if b_match:
-                            net_qty = float(b_match.get("net_qty") or b_match.get("netQty") or b_match.get("net_quantity") or b_match.get("quantity") or b_match.get("qty") or 0.0)
-                            if net_qty > 0:
-                                position_status = f"OPEN (Broker Qty: {int(net_qty)})"
-                                bp_px = float(b_match.get("ltp") or b_match.get("last_price") or b_match.get("current_price") or b_match.get("market_price") or 0.0)
-                                if bp_px > 0 and pos.status == "OPEN":
-                                    pos.last_price = bp_px
-                                    pos.on_tick(bp_px, now_ts)
-                            elif net_qty == 0 and pos.status == "OPEN":
+                        if b_match and net_qty > 0:
+                            if pos.status == "PENDING":
+                                pos.status = "OPEN"
+                                status_changed = True
+                                # Sync fill price from broker trades if available
+                                if pos.executed_entry is None and isinstance(broker_trades, list):
+                                    matched_t = next(
+                                        (t for t in broker_trades if isinstance(t, dict) and str(t.get("order_id") or "") == pos.order_id),
+                                        None,
+                                    )
+                                    if matched_t and float(matched_t.get("price") or 0.0) > 0:
+                                        exec_px = float(matched_t["price"])
+                                        pos.entry = exec_px
+                                        pos.executed_entry = exec_px
+                                        pos.risk = abs(pos.entry - pos.initial_stop)
+                                print(f"  [LIVE POSITION OPENED] {sym} confirmed open on broker (Qty: {int(net_qty)}, Entry: Rs {pos.entry:.2f})")
+                            position_status = f"OPEN (Broker Qty: {int(net_qty)})"
+                            bp_px = float(b_match.get("ltp") or b_match.get("last_price") or b_match.get("current_price") or b_match.get("market_price") or 0.0)
+                            if bp_px > 0 and pos.status == "OPEN":
+                                pos.last_price = bp_px
+                                pos.on_tick(bp_px, now_ts)
+                        elif b_match and net_qty == 0:
+                            if pos.status == "OPEN":
                                 pos.close(pos.last_price, now_ts, "EXIT_EXTERNAL")
                                 position_status = "CLOSED_ON_BROKER"
+                                status_changed = True
+                            else:
+                                position_status = "PENDING"
+                        else:
+                            # Not present in broker open positions
+                            if pos.status == "PENDING":
+                                position_status = "PENDING"
+                            elif ord_st in _PENDING_ORDER_STATUSES or pos.executed_entry is None:
+                                pos.status = "PENDING"
+                                position_status = "PENDING"
+                                status_changed = True
+                            else:
+                                pos.close(pos.last_price, now_ts, "EXIT_EXTERNAL")
+                                position_status = "CLOSED_ON_BROKER"
+                                status_changed = True
 
                     if pos.status == "OPEN":
                         diff = pos.last_price - pos.entry
@@ -832,6 +936,10 @@ class LiveTradeSession:
                         print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16} | "
                               f"Entry: Rs {pos.entry:>7.2f} | LTP: Rs {pos.last_price:>7.2f} ({sign}{diff:.2f}, {sign}{diff_pct:.1f}%) | "
                               f"Trail SL: Rs {pos.stop:>7.2f} ({tsl_st}) | P&L: Rs {pos.pnl:>+8.2f}")
+                    elif pos.status == "PENDING":
+                        print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16} | "
+                              f"Entry: Rs {pos.entry:>7.2f} | LTP: Rs {pos.last_price:>7.2f} | "
+                              f"SL: Rs {pos.stop:>7.2f} (Waiting Broker Fill)")
                     else:
                         diff = (pos.exit_price or pos.last_price) - pos.entry
                         diff_pct = (diff / pos.entry * 100) if pos.entry else 0.0
@@ -842,16 +950,8 @@ class LiveTradeSession:
                               f"Trail SL: Rs {pos.stop:>7.2f} ({tsl_st}) | P&L: Rs {pos.pnl:>+8.2f}")
                 else:
                     # Check if broker shows an open position for it even without local pos
-                    broker_has_pos = False
-                    if is_live and broker_positions and contract:
-                        for bp in broker_positions:
-                            sec_id = str(bp.get("security_id") or bp.get("securityId") or "")
-                            b_sym = str(bp.get("symbol") or bp.get("trading_symbol") or bp.get("tradingSymbol") or bp.get("stock_code") or "")
-                            net_qty = float(bp.get("net_qty") or bp.get("netQty") or bp.get("net_quantity") or bp.get("quantity") or bp.get("qty") or 0.0)
-                            if net_qty > 0 and ((sym in b_sym or b_sym in sym) or (contract.security_id in sec_id or sec_id in contract.security_id)):
-                                broker_has_pos = True
-                                break
-                    if broker_has_pos:
+                    _, net_qty = _find_broker_position(broker_positions, sym, contract) if (is_live and positions_fetched and contract) else (None, 0.0)
+                    if net_qty > 0:
                         trade_status = "EXTERNAL"
                         position_status = "OPEN_ON_BROKER"
                         print(f"  [10s STATUS] {sym:<10} | Trade: {trade_status:<22} | Position: {position_status:<16}")
@@ -943,19 +1043,10 @@ class LiveTradeSession:
                     new_pos.order_id = order_id
                     print(f"  [LIVE ORDER PLACED] {sym} BUY {new_pos.qty} {contract.option_type} {contract.strike} (Order ID: {order_id})")
 
-                    time.sleep(1)
-                    try:
-                        trades = self.broker.get_trade_list(today())
-                        matched = next((t for t in trades if str(t.get("order_id") or "") == order_id or
-                                        (t.get("action", "").upper() == "BUY" and sym in str(t.get("symbol", "")))), None)
-                        if matched and float(matched.get("price") or 0) > 0:
-                            exec_px = float(matched["price"])
-                            new_pos.entry = exec_px
-                            new_pos.executed_entry = exec_px
-                            new_pos.risk = abs(new_pos.entry - new_pos.initial_stop)
-                            print(f"  [LIVE TRADE CONFIRMED] {sym} filled at Rs {exec_px:.2f} (Trade ID: {matched.get('trade_id', order_id)})")
-                    except Exception as e:
-                        print(f"  [LIVE TRADE LIST] Could not verify trade list for {sym}: {e}")
+                    _sync_live_activation(self.broker, new_pos, sym, contract, prefix="  ")
+                    if new_pos.status in ("ORDER_REJECTED", "ORDER_CANCELLED"):
+                        self.skipped.append((sym, f"order {new_pos.status.lower()}"))
+                        continue
                 else:
                     new_pos.mode = "paper"
 
